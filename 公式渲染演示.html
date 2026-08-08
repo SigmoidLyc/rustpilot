@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>公式渲染演示 - KaTeX</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<style>
+  body {
+    margin: 0; padding: 40px 20px;
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+    color: #e2e8f0; min-height: 100vh;
+  }
+  h1 { text-align: center; font-weight: 600; letter-spacing: 1px; margin-bottom: 8px; }
+  .sub { text-align: center; color: #94a3b8; margin-bottom: 36px; font-size: 14px; }
+  .card {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 14px;
+    padding: 22px 28px;
+    margin: 18px auto;
+    max-width: 760px;
+    backdrop-filter: blur(4px);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+  }
+  .card .label {
+    font-size: 13px; color: #7dd3fc;
+    font-weight: 600; margin-bottom: 12px;
+    letter-spacing: 0.5px;
+  }
+  .card .formula {
+    font-size: 1.35em;
+    text-align: center;
+    overflow-x: auto;
+    padding: 8px 0;
+  }
+  .card .formula .katex { color: #f8fafc; }
+  .footer { text-align: center; color: #64748b; font-size: 12px; margin-top: 40px; }
+</style>
+</head>
+<body>
+  <h1>📐 公式渲染演示</h1>
+  <div class="sub">RustPilot 生成 · KaTeX 排版 · 双击文件在浏览器中打开</div>
+
+  <div class="card"><div class="label">① 欧拉恒等式 —— 最美公式</div>
+    <div class="formula">$$ e^{i\pi} + 1 = 0 $$</div></div>
+
+  <div class="card"><div class="label">② 勾股定理</div>
+    <div class="formula">$$ a^2 + b^2 = c^2 $$</div></div>
+
+  <div class="card"><div class="label">③ 高斯积分</div>
+    <div class="formula">$$ \int_{-\infty}^{\infty} e^{-x^2}\,dx = \sqrt{\pi} $$</div></div>
+
+  <div class="card"><div class="label">④ 正态分布概率密度</div>
+    <div class="formula">$$ f(x) = \frac{1}{\sigma\sqrt{2\pi}}\, e^{-\frac{(x-\mu)^2}{2\sigma^2}} $$</div></div>
+
+  <div class="card"><div class="label">⑤ 贝叶斯定理</div>
+    <div class="formula">$$ P(A \mid B) = \frac{P(B \mid A)\, P(A)}{P(B)} $$</div></div>
+
+  <div class="card"><div class="label">⑥ 一元二次方程求根公式</div>
+    <div class="formula">$$ x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a} $$</div></div>
+
+  <div class="card"><div class="label">⑦ 泰勒级数</div>
+    <div class="formula">$$ f(x) = \sum_{n=0}^{\infty} \frac{f^{(n)}(a)}{n!}\, (x-a)^n $$</div></div>
+
+  <div class="card"><div class="label">⑧ 黎曼 ζ 函数</div>
+    <div class="formula">$$ \zeta(s) = \sum_{n=1}^{\infty} \frac{1}{n^s} $$</div></div>
+
+  <div class="card"><div class="label">⑨ 矩阵乘法</div>
+    <div class="formula">$$ \begin{pmatrix} a & b \\ c & d \end{pmatrix} \begin{pmatrix} x \\ y \end{pmatrix} = \begin{pmatrix} ax + by \\ cx + dy \end{pmatrix} $$</div></div>
+
+  <div class="card"><div class="label">⑩ 麦克斯韦方程组(微分形式)</div>
+    <div class="formula">$$ \nabla \cdot \mathbf{E} = \frac{\rho}{\varepsilon_0}, \quad \nabla \times \mathbf{B} = \mu_0 \mathbf{J} + \mu_0\varepsilon_0 \frac{\partial \mathbf{E}}{\partial t} $$</div></div>
+
+  <div class="footer">RustPilot · 公式渲染演示 · KaTeX CDN(需联网加载)</div>
+
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body, {
+    delimiters: [
+      {left: '$$', right: '$$', display: true},
+      {left: '$', right: '$', display: false}
+    ],
+    throwOnError: false
+  });"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+node_modules/
+.npm-cache/
+dist/
+.vite/
+.svelte-kit/
+src-tauri/target/
+src-tauri/gen/
+target-msvc/
+target-test/
+.runtime/
+.env
+.env.local
+*.log
+*.pdb
+*.tmp
+
+# Local RustPilot runtime data
+tasks.json
+settings.json
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
