@@ -24,6 +24,27 @@ export interface AgentMemoryEntry {
   tool_calls: AgentMessageToolCall[];
   name: string | null;
   base64_image: string | null;
+  attachments: TaskAttachment[];
+}
+
+export interface TaskAttachment {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+  storage_key: string;
+}
+
+export interface AttachmentInput {
+  name: string;
+  mime: string;
+  data: string;
+}
+
+export interface AttachmentPathInput {
+  path: string;
+  name: string;
+  mime: string;
 }
 
 export interface AgentMessageToolCall {
@@ -74,6 +95,7 @@ export interface TaskMessage {
   tool_call_id: string | null;
   name: string | null;
   base64_image: string | null;
+  attachments: TaskAttachment[];
 }
 
 export interface AgentStep {

@@ -25,8 +25,10 @@
     subscribeToEvents,
     updateSettings
   } from "./lib/api";
+  import { serializeFiles } from "./lib/attachments";
   import type {
     AgentStep,
+    AttachmentPathInput,
     ApprovalRequest,
     SettingsInput,
     SettingsView,
@@ -316,23 +318,30 @@
     actionError = "";
   }
 
-  async function sendTask(prompt: string): Promise<void> {
+  async function sendTask(
+    prompt: string,
+    files: File[],
+    paths: AttachmentPathInput[]
+  ): Promise<boolean> {
     actionError = "";
     if (!isTauriRuntime) {
       actionError = "The desktop runtime is required to start a task.";
-      return;
+      return false;
     }
     if (settings.demo_mode) {
       actionError = "Configure an API key in Settings before sending a task.";
-      return;
+      return false;
     }
     try {
+      const attachments = await serializeFiles(files);
       const task = selectedTask
-        ? await continueTask(selectedTask.id, prompt)
-        : await createTask(prompt);
+        ? await continueTask(selectedTask.id, prompt, attachments, paths)
+        : await createTask(prompt, attachments, paths);
       handleCreated(task);
+      return true;
     } catch (error) {
       actionError = error instanceof Error ? error.message : String(error);
+      return false;
     }
   }
 

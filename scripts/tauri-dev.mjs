@@ -1,7 +1,10 @@
 import { spawn, spawnSync } from "node:child_process";
-import { closeSync, existsSync, openSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
+import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
+import { readViteLease, releaseViteLease, writeViteLease } from "./dev-lease.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(scriptDir, "..");
@@ -11,7 +14,9 @@ const targetDir = join(targetRoot, "debug");
 const viteScript = join(root, "node_modules", "vite", "bin", "vite.js");
 const appLauncher = join(root, "scripts", "launch-app.mjs");
 const executable = join(targetDir, "rustpilot.exe");
+const leasePath = join(root, ".runtime", "vite-lease.json");
 const viteUrl = "http://127.0.0.1:1420/";
+const vitePort = 1420;
 
 const sleep = (milliseconds) => new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 
@@ -58,6 +63,89 @@ function stopProcess(processHandle) {
   }
 }
 
+function buildApplication(cargo) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const build = spawn(cargo, ["build", "--locked", "--no-default-features", "--bin", "rustpilot"], {
+      cwd: tauriDir,
+      env: { ...process.env, CARGO_TARGET_DIR: targetRoot },
+      stdio: "inherit"
+    });
+    build.once("error", rejectPromise);
+    build.once("exit", (code, signal) => {
+      if (signal) rejectPromise(new Error(`Rust build stopped by ${signal}.`));
+      else if (code !== 0) rejectPromise(new Error(`Rust build failed with exit code ${code}.`));
+      else resolvePromise();
+    });
+  });
+}
+
+function isPortOpen(port) {
+  return new Promise((resolvePromise) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+    const settle = (open) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolvePromise(open);
+    };
+    socket.setTimeout(200);
+    socket.once("connect", () => settle(true));
+    socket.once("timeout", () => settle(false));
+    socket.once("error", () => settle(false));
+  });
+}
+
+async function waitForVitePortRelease() {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (!(await isPortOpen(vitePort))) return;
+    await sleep(100);
+  }
+  throw new Error(`The previous Vite server still owns ${viteUrl}.`);
+}
+
+async function fetchWithTimeout(url, timeoutMilliseconds) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMilliseconds);
+  try {
+    const response = await fetch(url, { cache: "no-store", signal: controller.signal });
+    await response.arrayBuffer();
+    return response;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function frontendReady(timeoutMilliseconds) {
+  try {
+    const responses = await Promise.all([
+      fetchWithTimeout(viteUrl, timeoutMilliseconds),
+      fetchWithTimeout(new URL("src/main.ts", viteUrl), timeoutMilliseconds),
+      fetchWithTimeout(new URL("src/App.svelte", viteUrl), timeoutMilliseconds),
+    ]);
+    return responses.every((response) => response.status >= 200 && response.status < 500);
+  } catch {
+    return false;
+  }
+}
+
+async function claimReusableVite() {
+  const lease = readViteLease(leasePath);
+  if (!lease || !processExists(lease.pid) || !(await frontendReady(500))) return null;
+  const token = randomUUID();
+  writeViteLease(leasePath, lease.pid, token);
+  return { pid: lease.pid, token, process: null, reused: true };
+}
+
 function stopExistingApplication(executable) {
   if (process.platform !== "win32") {
     return;
@@ -99,74 +187,71 @@ async function waitForExecutableRelease(executable) {
 }
 
 async function waitForVite(vite) {
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    try {
-      const response = await fetch(viteUrl);
-      if (response.status >= 200 && response.status < 500) {
-        return;
-      }
-    } catch {
-      if (vite.exitCode !== null) {
-        throw new Error("Vite exited before becoming ready.");
-      }
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    const exitCode = vite.process?.exitCode;
+    if (!processExists(vite.pid) || (exitCode !== null && exitCode !== undefined)) {
+      throw new Error(`Vite exited before becoming ready${vite.process ? ` (code ${exitCode})` : ""}.`);
     }
+    if (await frontendReady(1000)) return;
     await sleep(250);
   }
   throw new Error(`Vite did not become ready at ${viteUrl}.`);
 }
 
-function startWatcher(appPid, vitePid) {
-  const watcher = spawn(process.execPath, [fileURLToPath(import.meta.url), "--watch", String(appPid), String(vitePid)], {
-    cwd: root,
-    detached: true,
-    windowsHide: true,
-    stdio: "ignore",
-  });
+function startWatcher(appPid, vitePid, leaseToken) {
+  const watcher = spawn(
+    process.execPath,
+    [fileURLToPath(import.meta.url), "--watch", String(appPid), String(vitePid), leaseToken],
+    {
+      cwd: root,
+      detached: true,
+      windowsHide: true,
+      stdio: "ignore",
+    },
+  );
   watcher.unref();
 }
 
-async function watch(appPid, vitePid) {
+async function watch(appPid, vitePid, leaseToken) {
   const timer = setInterval(() => {
     try {
       process.kill(appPid, 0);
     } catch {
-      try {
-        process.kill(vitePid);
-      } catch {
-        // The dev server may already have exited.
-      }
+      releaseViteLease(leasePath, vitePid, leaseToken);
       clearInterval(timer);
     }
   }, 1000);
 }
 
 async function start() {
-  const vite = spawn(process.execPath, [viteScript, "--host", "127.0.0.1", "--port", "1420"], {
-    cwd: root,
-    detached: true,
-    windowsHide: true,
-    stdio: "ignore",
-  });
-  vite.unref();
+  mkdirSync(dirname(leasePath), { recursive: true });
+  let vite;
+  let viteProcess;
 
   try {
-    await waitForVite(vite);
+    vite = await claimReusableVite();
     stopExistingApplication(executable);
-    await waitForExecutableRelease(executable);
-    const cargo = process.platform === "win32" ? "cargo.exe" : "cargo";
-    const build = spawnSync(cargo, ["build", "--locked", "--no-default-features", "--bin", "rustpilot"], {
-      cwd: tauriDir,
-      env: { ...process.env, CARGO_TARGET_DIR: targetRoot },
-      stdio: "inherit",
-    });
-    if (build.error) {
-      throw build.error;
-    }
-    if (build.status !== 0) {
-      throw new Error(`Rust build failed with exit code ${build.status}.`);
+    if (vite) {
+      await waitForExecutableRelease(executable);
+      console.log(`Reusing Vite server at ${viteUrl}.`);
+    } else {
+      await Promise.all([waitForExecutableRelease(executable), waitForVitePortRelease()]);
+      viteProcess = spawn(process.execPath, [viteScript, "--host", "127.0.0.1", "--port", String(vitePort)], {
+        cwd: root,
+        detached: true,
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      viteProcess.unref();
+      const token = randomUUID();
+      writeViteLease(leasePath, viteProcess.pid, token);
+      vite = { pid: viteProcess.pid, token, process: viteProcess, reused: false };
     }
 
-    const app = spawn(process.execPath, [appLauncher, executable, targetDir, String(vite.pid)], {
+    const cargo = process.platform === "win32" ? "cargo.exe" : "cargo";
+    await Promise.all([waitForVite(vite), buildApplication(cargo)]);
+
+    const app = spawn(process.execPath, [appLauncher, executable, targetDir, String(vite.pid), leasePath, vite.token], {
       cwd: root,
       detached: true,
       windowsHide: true,
@@ -174,17 +259,17 @@ async function start() {
       stdio: "ignore",
     });
     app.unref();
-    await sleep(2000);
-    startWatcher(app.pid, vite.pid);
+    startWatcher(app.pid, vite.pid, vite.token);
     console.log(`RustPilot launch requested. Vite remains available at ${viteUrl}.`);
   } catch (error) {
-    stopProcess(vite);
+    if (vite) releaseViteLease(leasePath, vite.pid, vite.token);
+    else stopProcess(viteProcess);
     throw error;
   }
 }
 
 if (process.argv[2] === "--watch") {
-  await watch(Number(process.argv[3]), Number(process.argv[4]));
+  await watch(Number(process.argv[3]), Number(process.argv[4]), process.argv[5]);
 } else {
   await start();
 }

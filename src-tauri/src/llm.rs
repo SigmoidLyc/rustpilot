@@ -846,7 +846,7 @@ impl OpenAiCompatibleClient {
     }
 
     pub fn supports_images(&self) -> bool {
-        MULTIMODAL_MODELS.contains(&self.settings.model.as_str())
+        model_supports_images(&self.settings.model)
     }
 
     pub fn completion_url(base_url: &str) -> String {
@@ -1547,6 +1547,34 @@ impl OpenAiCompatibleClient {
             }
         }
     }
+}
+
+pub fn model_supports_images(model: &str) -> bool {
+    if MULTIMODAL_MODELS.contains(&model) {
+        return true;
+    }
+    let normalized = model.to_ascii_lowercase();
+    [
+        "vision",
+        "-vl",
+        "_vl",
+        "gemini",
+        "claude-3",
+        "claude-4",
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-5",
+        "llava",
+        "pixtral",
+        "qwen2-vl",
+        "qwen2.5-vl",
+        "qwen3-vl",
+        "o1",
+        "o3",
+        "o4",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 #[allow(clippy::upper_case_acronyms)]

@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AttachmentInput,
+  AttachmentPathInput,
   AgentStep,
   ApprovalRequest,
   Task,
@@ -30,9 +32,33 @@ export async function invokeRust<T>(command: string, args?: Record<string, unkno
 export const listTasks = () => invokeRust<TaskSummary[]>("list_tasks");
 export const listArchivedTasks = () => invokeRust<TaskSummary[]>("list_archived_tasks");
 export const getTask = (taskId: string) => invokeRust<Task>("get_task", { taskId });
-export const createTask = (prompt: string) => invokeRust<Task>("create_task", { prompt });
-export const continueTask = (taskId: string, prompt: string) =>
-  invokeRust<Task>("continue_task", { taskId, prompt });
+export const createTask = (
+  prompt: string,
+  attachments: AttachmentInput[] = [],
+  paths: AttachmentPathInput[] = []
+) =>
+  invokeRust<Task>("create_task", {
+    prompt,
+    attachmentInputs: attachments,
+    attachmentPaths: paths
+  });
+export const continueTask = (
+  taskId: string,
+  prompt: string,
+  attachments: AttachmentInput[] = [],
+  paths: AttachmentPathInput[] = []
+) =>
+  invokeRust<Task>("continue_task", {
+    taskId,
+    prompt,
+    attachmentInputs: attachments,
+    attachmentPaths: paths
+  });
+export const getAttachmentPreview = (taskId: string, attachmentId: string) =>
+  invokeRust<{ mime: string; data_url: string }>("get_attachment_preview", {
+    taskId,
+    attachmentId
+  });
 export const stopTask = (taskId: string) => invokeRust<boolean>("stop_task", { taskId });
 export const retryTask = (taskId: string) => invokeRust<Task>("retry_task", { taskId });
 export const archiveTask = (taskId: string) => invokeRust<TaskSummary>("archive_task", { taskId });

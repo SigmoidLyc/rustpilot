@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 pub mod agent;
 pub mod agents;
+pub mod attachments;
 pub mod bedrock;
 pub mod config;
 pub mod flow;
@@ -165,6 +166,7 @@ enum PersistedStreamEvent {
 struct LoadedTaskStore {
     tasks: HashMap<String, Task>,
     event_bytes: HashMap<String, u64>,
+    connection: Connection,
 }
 
 fn task_database_path(data_dir: &Path) -> PathBuf {
@@ -375,7 +377,11 @@ fn load_task_store(data_dir: &Path) -> Result<LoadedTaskStore, String> {
         remove_legacy_task_files(&legacy_path);
     }
 
-    Ok(LoadedTaskStore { tasks, event_bytes })
+    Ok(LoadedTaskStore {
+        tasks,
+        event_bytes,
+        connection,
+    })
 }
 
 fn persisted_stream_event(event: &llm::StreamEvent) -> Option<PersistedStreamEvent> {
@@ -644,14 +650,13 @@ impl TaskPersistence {
 
     fn start(
         &self,
-        data_dir: PathBuf,
+        connection: Connection,
         durable_tasks: HashMap<String, Task>,
         event_bytes: HashMap<String, u64>,
     ) -> Result<(), String> {
         if self.started.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let connection = open_task_database(&task_database_path(&data_dir))?;
         let pending = Arc::clone(&self.pending);
         let notify = Arc::clone(&self.notify);
         tauri::async_runtime::spawn(async move {
@@ -1088,6 +1093,8 @@ pub struct AgentMemoryEntry {
     pub name: Option<String>,
     #[serde(default)]
     pub base64_image: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<attachments::AttachmentRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1207,6 +1214,8 @@ pub struct TaskMessage {
     pub name: Option<String>,
     #[serde(default)]
     pub base64_image: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<attachments::AttachmentRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1487,10 +1496,12 @@ impl AppState {
             settings.api_key = first_env_value(&["RUSTPILOT_API_KEY", "OPENAI_API_KEY"]);
         }
 
-        let loaded_store = load_task_store(&data_dir)?;
-        let mut loaded_tasks = loaded_store.tasks;
+        let LoadedTaskStore {
+            tasks: mut loaded_tasks,
+            event_bytes,
+            connection,
+        } = load_task_store(&data_dir)?;
         let durable_tasks = loaded_tasks.clone();
-        let event_bytes = loaded_store.event_bytes;
         let mut repaired_task_ids = Vec::new();
         {
             let mut tasks = self
@@ -1520,7 +1531,7 @@ impl AppState {
         }
 
         self.task_persistence
-            .start(data_dir, durable_tasks, event_bytes)?;
+            .start(connection, durable_tasks, event_bytes)?;
         for task_id in repaired_task_ids {
             self.persist_task(&task_id)?;
         }
@@ -1777,6 +1788,7 @@ fn memory_from_task_messages(messages: &[TaskMessage]) -> Vec<AgentMemoryEntry> 
             tool_calls: message.tool_calls.clone(),
             name: message.name.clone(),
             base64_image: message.base64_image.clone(),
+            attachments: message.attachments.clone(),
         })
         .collect()
 }
@@ -1795,6 +1807,7 @@ fn recovered_tool_result(call: &agent::MessageToolCall) -> AgentMemoryEntry {
         tool_calls: Vec::new(),
         name: Some(call.function.name.clone()),
         base64_image: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -2037,6 +2050,7 @@ fn repair_task_record(task: &mut Task) -> bool {
                 tool_calls: Vec::new(),
                 name: None,
                 base64_image: None,
+                attachments: Vec::new(),
             }]
         } else {
             recovered
@@ -2102,6 +2116,7 @@ fn record_memory(
             tool_calls: Vec::new(),
             name: None,
             base64_image: None,
+            attachments: Vec::new(),
         },
     )
 }
@@ -2114,6 +2129,7 @@ struct MemoryRecord {
     tool_calls: Vec<agent::MessageToolCall>,
     name: Option<String>,
     base64_image: Option<String>,
+    attachments: Vec<attachments::AttachmentRef>,
 }
 
 fn record_memory_full(state: &AppState, task_id: &str, record: MemoryRecord) -> Result<(), String> {
@@ -2134,6 +2150,7 @@ fn record_memory_full(state: &AppState, task_id: &str, record: MemoryRecord) -> 
         tool_calls: record.tool_calls,
         name: record.name,
         base64_image: record.base64_image,
+        attachments: record.attachments,
     });
     trim_memory_to_budget(&mut task.memory, MAX_MEMORY_ENTRIES);
     touch_task(task);
@@ -2297,6 +2314,7 @@ fn add_message(
         tool_call_id: None,
         name: None,
         base64_image: None,
+        attachments: Vec::new(),
     };
     {
         let mut tasks = state
@@ -2334,6 +2352,7 @@ fn add_tool_message(
         tool_call_id: Some(model_tool_call_id.to_string()),
         name: Some(name.to_string()),
         base64_image: None,
+        attachments: Vec::new(),
     };
     {
         let mut tasks = state
@@ -2512,6 +2531,7 @@ fn append_stream_event(
                     tool_call_id: None,
                     name: None,
                     base64_image: None,
+                    attachments: Vec::new(),
                 };
                 apply_stream_event(&mut message, event);
                 task.messages.push(message.clone());
@@ -2623,6 +2643,7 @@ fn attach_tool_calls_to_last_message(
                 tool_call_id: None,
                 name: None,
                 base64_image: None,
+                attachments: Vec::new(),
             };
             rebuild_assistant_parts(&mut message);
             task.messages.push(message.clone());
@@ -6830,6 +6851,8 @@ struct ChatMessage {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(default, skip_serializing)]
+    attachments: Vec<attachments::AttachmentRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6884,9 +6907,109 @@ fn memory_to_chat_messages(memory: &[AgentMemoryEntry]) -> Vec<ChatMessage> {
                 ),
                 tool_call_id: entry.tool_call_id.clone(),
                 name: entry.name.clone(),
+                attachments: entry.attachments.clone(),
             })
         })
         .collect()
+}
+
+fn chat_message_value(
+    message: &ChatMessage,
+    data_dir: &Path,
+    supports_images: bool,
+) -> Result<Value, String> {
+    let mut value = serde_json::to_value(message)
+        .map_err(|error| format!("Unable to encode chat message: {error}"))?;
+    if message.attachments.is_empty() {
+        return Ok(value);
+    }
+    if message.role != "user" {
+        return Err("Only user messages can contain attachments.".to_string());
+    }
+
+    let contains_image = message
+        .attachments
+        .iter()
+        .any(|attachment| attachments::is_image(&attachment.mime));
+    if contains_image && !supports_images {
+        let image_name = message
+            .attachments
+            .iter()
+            .find(|attachment| attachments::is_image(&attachment.mime))
+            .map(|attachment| attachment.name.as_str())
+            .unwrap_or("image");
+        return Err(format!(
+            "The configured model does not support image attachments. Remove {image_name} or choose a vision model."
+        ));
+    }
+
+    if !contains_image {
+        let mut text = message.content.clone().unwrap_or_default();
+        for attachment in &message.attachments {
+            let bytes = attachments::read(data_dir, attachment)?;
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&attachment_prompt_text(data_dir, attachment, &bytes));
+        }
+        value["content"] = Value::String(text);
+        return Ok(value);
+    }
+
+    let mut content = Vec::with_capacity(message.attachments.len() + 1);
+    if let Some(text) = message.content.as_deref().filter(|text| !text.is_empty()) {
+        content.push(json!({"type": "text", "text": text}));
+    }
+    for attachment in &message.attachments {
+        let bytes = attachments::read(data_dir, attachment)?;
+        if attachments::is_image(&attachment.mime) {
+            content.push(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", attachment.mime, base64_encode(&bytes))
+                }
+            }));
+            continue;
+        }
+        content.push(json!({
+            "type": "text",
+            "text": attachment_prompt_text(data_dir, attachment, &bytes)
+        }));
+    }
+    value["content"] = Value::Array(content);
+    Ok(value)
+}
+
+fn attachment_prompt_text(
+    data_dir: &Path,
+    attachment: &attachments::AttachmentRef,
+    bytes: &[u8],
+) -> String {
+    if attachments::is_text(&attachment.mime, &attachment.name) {
+        let text_bytes = &bytes[..bytes.len().min(attachments::MAX_TEXT_CONTEXT_BYTES)];
+        let mut text = String::from_utf8_lossy(text_bytes).into_owned();
+        if bytes.len() > text_bytes.len() {
+            text.push_str("\n[attachment text truncated]");
+        }
+        let local_path = data_dir.join(&attachment.storage_key);
+        return format!(
+            "[Attached file: {} | {} | {} bytes]\n{}\n[Full attachment path: {}]",
+            attachment.name,
+            attachment.mime,
+            attachment.size,
+            text,
+            local_path.display()
+        );
+    }
+
+    let local_path = data_dir.join(&attachment.storage_key);
+    format!(
+        "[Attached file: {} | {} | {} bytes]\nThis file is stored locally at {}. Use the file tools if you need to inspect its raw contents.",
+        attachment.name,
+        attachment.mime,
+        attachment.size,
+        local_path.display()
+    )
 }
 
 fn validate_chat_message_context(messages: &[ChatMessage]) -> Result<(), String> {
@@ -7376,11 +7499,17 @@ async fn stream_openai(
         Some(tools.schema_hash.as_ref()),
     ))
     .map_err(|error| AgentError::Message(error.to_string()))?;
+    let data_dir = state
+        .storage_dir
+        .read()
+        .map_err(|_| AgentError::Message("Storage lock is poisoned".to_string()))?
+        .clone()
+        .ok_or_else(|| AgentError::Message("Attachment storage is not initialized.".to_string()))?;
     let request_messages = messages
         .iter()
-        .map(serde_json::to_value)
+        .map(|message| chat_message_value(message, &data_dir, client.supports_images()))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| AgentError::Message(format!("Unable to encode LLM messages: {error}")))?;
+        .map_err(AgentError::Message)?;
     // Publish the assistant turn before waiting for the first token so the UI can show progress.
     let message = add_message(app, state, task_id, "assistant", String::new(), true)
         .map_err(AgentError::Message)?;
@@ -7477,6 +7606,7 @@ async fn run_real(
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            attachments: Vec::new(),
         },
         ChatMessage {
             role: "system".to_string(),
@@ -7484,6 +7614,7 @@ async fn run_real(
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            attachments: Vec::new(),
         },
     ];
     let system_message_count = system_messages.len();
@@ -7495,6 +7626,7 @@ async fn run_real(
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            attachments: Vec::new(),
         });
     } else {
         messages.extend(memory_to_chat_messages(&task_memory));
@@ -7601,6 +7733,7 @@ async fn run_real(
                 tool_calls: memory_tool_calls,
                 name: None,
                 base64_image: None,
+                attachments: Vec::new(),
             },
         )
         .map_err(AgentError::Message)?;
@@ -7625,6 +7758,7 @@ async fn run_real(
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
+                attachments: Vec::new(),
             });
             record_memory(
                 state,
@@ -7654,6 +7788,7 @@ async fn run_real(
                 .then_some(completion.tool_calls.clone()),
             tool_call_id: None,
             name: None,
+            attachments: Vec::new(),
         };
         messages.push(assistant_message);
 
@@ -7812,6 +7947,7 @@ async fn run_real(
                 tool_calls: None,
                 tool_call_id: Some(tool_call.id.clone()),
                 name: Some(tool_call.function.name.clone()),
+                attachments: Vec::new(),
             });
         }
         finish_step(
@@ -7844,6 +7980,7 @@ async fn run_real(
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
+                attachments: Vec::new(),
             });
         } else {
             messages.extend(memory_to_chat_messages(&refreshed_memory));
@@ -8038,20 +8175,119 @@ async fn get_task(state: State<'_, AppState>, task_id: String) -> Result<Task, S
     task_snapshot(&state, &task_id)
 }
 
-fn create_task_internal(app: &AppHandle, state: &AppState, prompt: String) -> Result<Task, String> {
+fn attachment_data_directory(state: &AppState) -> Result<PathBuf, String> {
+    state
+        .storage_dir
+        .read()
+        .map_err(|_| "Storage lock is poisoned".to_string())?
+        .clone()
+        .ok_or_else(|| "Attachment storage is not initialized.".to_string())
+}
+
+fn task_title(prompt: &str, attachment_count: usize) -> String {
+    if !prompt.trim().is_empty() {
+        return make_title(prompt);
+    }
+    if attachment_count == 1 {
+        "Attached file".to_string()
+    } else {
+        format!("{} attached files", attachment_count)
+    }
+}
+
+fn store_task_attachments(
+    state: &AppState,
+    task_id: &str,
+    encoded_inputs: &[attachments::AttachmentInput],
+    path_inputs: &[attachments::AttachmentPathInput],
+) -> Result<Vec<attachments::AttachmentRef>, String> {
+    if encoded_inputs.is_empty() && path_inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let data_dir = attachment_data_directory(state)?;
+    let references =
+        attachments::store_inputs_and_paths(&data_dir, task_id, encoded_inputs, path_inputs)?;
+    let model = match state.settings.read() {
+        Ok(settings) => settings.model.clone(),
+        Err(_) => {
+            attachments::remove_refs(&data_dir, &references);
+            return Err("Settings lock is poisoned".to_string());
+        }
+    };
+    if references
+        .iter()
+        .any(|reference| attachments::is_image(&reference.mime))
+        && !llm::model_supports_images(&model)
+    {
+        attachments::remove_refs(&data_dir, &references);
+        return Err(format!(
+            "The configured model does not support image attachments. Remove the images or choose a vision model. Current model: {model}"
+        ));
+    }
+    Ok(references)
+}
+
+fn remove_stored_attachments(state: &AppState, references: &[attachments::AttachmentRef]) {
+    if references.is_empty() {
+        return;
+    }
+    if let Ok(data_dir) = attachment_data_directory(state) {
+        attachments::remove_refs(&data_dir, references);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentPreview {
+    pub mime: String,
+    pub data_url: String,
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn get_attachment_preview(
+    state: State<'_, AppState>,
+    task_id: String,
+    attachment_id: String,
+) -> Result<AttachmentPreview, String> {
+    let task = task_snapshot(&state, &task_id)?;
+    let attachment = task
+        .messages
+        .iter()
+        .flat_map(|message| message.attachments.iter())
+        .find(|attachment| attachment.id == attachment_id)
+        .cloned()
+        .ok_or_else(|| "Attachment not found.".to_string())?;
+    if !attachments::is_image(&attachment.mime) {
+        return Err("Only image attachments can be previewed.".to_string());
+    }
+    let bytes = attachments::read(&attachment_data_directory(&state)?, &attachment)?;
+    Ok(AttachmentPreview {
+        mime: attachment.mime.clone(),
+        data_url: format!("data:{};base64,{}", attachment.mime, base64_encode(&bytes)),
+    })
+}
+
+fn create_task_internal(
+    app: &AppHandle,
+    state: &AppState,
+    prompt: String,
+    attachment_inputs: Vec<attachments::AttachmentInput>,
+    attachment_paths: Vec<attachments::AttachmentPathInput>,
+) -> Result<Task, String> {
     let prompt = prompt.trim().to_string();
-    if prompt.is_empty() {
-        return Err("Task prompt cannot be empty.".to_string());
+    if prompt.is_empty() && attachment_inputs.is_empty() && attachment_paths.is_empty() {
+        return Err("Add a prompt or attach at least one file.".to_string());
     }
     if !api_key_configured(state)? {
         return Err(API_KEY_REQUIRED_MESSAGE.to_string());
     }
     let demo_mode = false;
     let task_id = new_id("task");
+    let attachment_refs =
+        store_task_attachments(state, &task_id, &attachment_inputs, &attachment_paths)?;
     let created_at = now();
     let task = Task {
         id: task_id.clone(),
-        title: make_title(&prompt),
+        title: task_title(&prompt, attachment_refs.len()),
         prompt: prompt.clone(),
         status: AgentStatus::Idle,
         created_at,
@@ -8072,6 +8308,7 @@ fn create_task_internal(app: &AppHandle, state: &AppState, prompt: String) -> Re
             tool_call_id: None,
             name: None,
             base64_image: None,
+            attachments: attachment_refs.clone(),
         }],
         memory: vec![AgentMemoryEntry {
             id: new_id("memory"),
@@ -8083,6 +8320,7 @@ fn create_task_internal(app: &AppHandle, state: &AppState, prompt: String) -> Re
             tool_calls: Vec::new(),
             name: None,
             base64_image: None,
+            attachments: attachment_refs.clone(),
         }],
         plans: Vec::new(),
         active_plan_id: None,
@@ -8094,15 +8332,37 @@ fn create_task_internal(app: &AppHandle, state: &AppState, prompt: String) -> Re
         error: None,
         persistence_revision: 1,
     };
-    {
-        let mut tasks = state
-            .tasks
-            .write()
-            .map_err(|_| "Task lock is poisoned".to_string())?;
-        tasks.insert(task_id.clone(), task.clone());
+    let insert_result = state
+        .tasks
+        .write()
+        .map_err(|_| "Task lock is poisoned".to_string());
+    let mut tasks = match insert_result {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            remove_stored_attachments(state, &attachment_refs);
+            return Err(error);
+        }
+    };
+    tasks.insert(task_id.clone(), task.clone());
+    drop(tasks);
+
+    let task = match task_snapshot(state, &task_id) {
+        Ok(task) => task,
+        Err(error) => {
+            if let Ok(mut tasks) = state.tasks.write() {
+                tasks.remove(&task_id);
+            }
+            remove_stored_attachments(state, &attachment_refs);
+            return Err(error);
+        }
+    };
+    if let Err(error) = state.persist_task(&task_id) {
+        if let Ok(mut tasks) = state.tasks.write() {
+            tasks.remove(&task_id);
+        }
+        remove_stored_attachments(state, &attachment_refs);
+        return Err(error);
     }
-    let task = task_snapshot(state, &task_id)?;
-    state.persist_task(&task_id)?;
     emit_event(app, "task_created", task.clone());
     emit_event(
         app,
@@ -8119,6 +8379,7 @@ fn create_task_internal(app: &AppHandle, state: &AppState, prompt: String) -> Re
             tool_call_id: None,
             name: None,
             base64_image: None,
+            attachments: Vec::new(),
         }),
     );
     start_task(app, state, task_id);
@@ -8130,8 +8391,16 @@ async fn create_task(
     app: AppHandle,
     state: State<'_, AppState>,
     prompt: String,
+    attachment_inputs: Option<Vec<attachments::AttachmentInput>>,
+    attachment_paths: Option<Vec<attachments::AttachmentPathInput>>,
 ) -> Result<Task, String> {
-    create_task_internal(&app, &state, prompt)
+    create_task_internal(
+        &app,
+        &state,
+        prompt,
+        attachment_inputs.unwrap_or_default(),
+        attachment_paths.unwrap_or_default(),
+    )
 }
 
 fn continue_task_internal(
@@ -8139,10 +8408,12 @@ fn continue_task_internal(
     state: &AppState,
     task_id: String,
     prompt: String,
+    attachment_inputs: Vec<attachments::AttachmentInput>,
+    attachment_paths: Vec<attachments::AttachmentPathInput>,
 ) -> Result<Task, String> {
     let prompt = prompt.trim().to_string();
-    if prompt.is_empty() {
-        return Err("Task prompt cannot be empty.".to_string());
+    if prompt.is_empty() && attachment_inputs.is_empty() && attachment_paths.is_empty() {
+        return Err("Add a prompt or attach at least one file.".to_string());
     }
     if !api_key_configured(state)? {
         return Err(API_KEY_REQUIRED_MESSAGE.to_string());
@@ -8158,6 +8429,23 @@ fn continue_task_internal(
         );
     }
 
+    {
+        let tasks = state
+            .tasks
+            .read()
+            .map_err(|_| "Task lock is poisoned".to_string())?;
+        let task = tasks
+            .get(&task_id)
+            .ok_or_else(|| "Task not found".to_string())?;
+        if task.archived {
+            return Err(
+                "Restore the archived task before continuing the conversation.".to_string(),
+            );
+        }
+    }
+
+    let attachment_refs =
+        store_task_attachments(state, &task_id, &attachment_inputs, &attachment_paths)?;
     let created_at = now();
     let message = TaskMessage {
         id: new_id("msg"),
@@ -8171,6 +8459,7 @@ fn continue_task_internal(
         tool_call_id: None,
         name: None,
         base64_image: None,
+        attachments: attachment_refs.clone(),
     };
     let memory = AgentMemoryEntry {
         id: new_id("memory"),
@@ -8182,8 +8471,9 @@ fn continue_task_internal(
         tool_calls: Vec::new(),
         name: None,
         base64_image: None,
+        attachments: attachment_refs,
     };
-    {
+    let update_result = (|| {
         let mut tasks = state
             .tasks
             .write()
@@ -8209,6 +8499,11 @@ fn continue_task_internal(
         task.memory.push(memory);
         trim_memory_to_budget(&mut task.memory, MAX_MEMORY_ENTRIES);
         touch_task(task);
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = update_result {
+        remove_stored_attachments(state, &message.attachments);
+        return Err(error);
     }
     let task = task_snapshot(state, &task_id)?;
     state.persist_task(&task_id)?;
@@ -8233,8 +8528,17 @@ async fn continue_task(
     state: State<'_, AppState>,
     task_id: String,
     prompt: String,
+    attachment_inputs: Option<Vec<attachments::AttachmentInput>>,
+    attachment_paths: Option<Vec<attachments::AttachmentPathInput>>,
 ) -> Result<Task, String> {
-    continue_task_internal(&app, &state, task_id, prompt)
+    continue_task_internal(
+        &app,
+        &state,
+        task_id,
+        prompt,
+        attachment_inputs.unwrap_or_default(),
+        attachment_paths.unwrap_or_default(),
+    )
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -8282,6 +8586,12 @@ async fn retry_task(
         task.final_answer = None;
         task.demo_mode = demo_mode;
         task.archived = false;
+        let initial_attachments = task
+            .messages
+            .iter()
+            .find(|message| message.role == "user")
+            .map(|message| message.attachments.clone())
+            .unwrap_or_default();
         task.memory = vec![AgentMemoryEntry {
             id: new_id("memory"),
             role: "user".to_string(),
@@ -8292,6 +8602,7 @@ async fn retry_task(
             tool_calls: Vec::new(),
             name: None,
             base64_image: None,
+            attachments: initial_attachments,
         }];
         task.plans.clear();
         task.active_plan_id = None;
@@ -8310,6 +8621,7 @@ async fn retry_task(
             tool_call_id: None,
             name: None,
             base64_image: None,
+            attachments: Vec::new(),
         });
         touch_task(task);
         task.clone()
@@ -8401,6 +8713,11 @@ async fn delete_task(state: State<'_, AppState>, task_id: String) -> Result<Task
     };
     let summary = task_summary(&task);
     state.persist_deleted_task(&task_id, delete_revision)?;
+    if let Ok(data_dir) = attachment_data_directory(&state) {
+        if let Err(error) = attachments::remove_task(&data_dir, &task_id) {
+            warn!(task_id = %task_id, error = %error, "Unable to remove task attachments");
+        }
+    }
     Ok(summary)
 }
 
@@ -8487,7 +8804,7 @@ fn spawn_a2a_server(app: &AppHandle, state: &AppState) {
         let app = app_handle.clone();
         let state = app_state.clone();
         Box::pin(async move {
-            let task = match create_task_internal(&app, &state, query) {
+            let task = match create_task_internal(&app, &state, query, Vec::new(), Vec::new()) {
                 Ok(task) => task,
                 Err(error) => return protocol::A2AResponse::error(error),
             };
@@ -8549,6 +8866,7 @@ pub fn run() {
             list_tasks,
             list_archived_tasks,
             get_task,
+            get_attachment_preview,
             create_task,
             continue_task,
             stop_task,
@@ -8634,6 +8952,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 base64_image: None,
+                attachments: Vec::new(),
             }],
             memory: Vec::new(),
             plans: Vec::new(),
@@ -9109,6 +9428,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             base64_image: None,
+            attachments: Vec::new(),
         };
 
         apply_stream_event(&mut message, &llm::StreamEvent::TextDelta("先".to_string()));
@@ -9249,6 +9569,7 @@ mod tests {
                 tool_calls: vec![call.clone()],
                 name: None,
                 base64_image: None,
+                attachments: Vec::new(),
             },
             AgentMemoryEntry {
                 id: "tool-1".to_string(),
@@ -9260,6 +9581,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 name: None,
                 base64_image: None,
+                attachments: Vec::new(),
             },
         ];
 
@@ -9292,6 +9614,7 @@ mod tests {
                 }],
                 name: None,
                 base64_image: None,
+                attachments: Vec::new(),
             },
             AgentMemoryEntry {
                 id: "user-2".to_string(),
@@ -9303,6 +9626,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 name: None,
                 base64_image: None,
+                attachments: Vec::new(),
             },
         ];
 
@@ -9329,6 +9653,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 name: None,
                 base64_image: None,
+                attachments: Vec::new(),
             },
             AgentMemoryEntry {
                 id: "old-assistant".to_string(),
@@ -9340,6 +9665,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 name: None,
                 base64_image: None,
+                attachments: Vec::new(),
             },
             AgentMemoryEntry {
                 id: "new-user".to_string(),
@@ -9351,6 +9677,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 name: None,
                 base64_image: None,
+                attachments: Vec::new(),
             },
             AgentMemoryEntry {
                 id: "new-assistant".to_string(),
@@ -9369,6 +9696,7 @@ mod tests {
                 }],
                 name: None,
                 base64_image: None,
+                attachments: Vec::new(),
             },
             AgentMemoryEntry {
                 id: "new-tool".to_string(),
@@ -9380,6 +9708,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 name: Some("rust_clock".to_string()),
                 base64_image: None,
+                attachments: Vec::new(),
             },
         ];
 

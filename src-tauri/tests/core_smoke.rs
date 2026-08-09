@@ -3,6 +3,9 @@
 #[path = "../src/agent.rs"]
 mod agent;
 
+#[path = "../src/attachments.rs"]
+mod attachments;
+
 use agent::{
     AgentKind, AgentState, BaseAgentRuntime, FunctionCall, Memory, Message, MessageToolCall,
     PlanningFlowRuntime, ToolCallAgentRuntime,

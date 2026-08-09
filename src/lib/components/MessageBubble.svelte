@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Bot, CircleAlert, Terminal, UserRound } from "lucide-svelte";
   import { renderMarkdown } from "../markdown";
+  import MessageAttachments from "./MessageAttachments.svelte";
   import type { TaskMessage } from "../types";
 
   export let message: TaskMessage;
@@ -32,6 +33,7 @@
         <span class="streaming-label">working</span>
       {/if}
     </div>
+    <MessageAttachments taskId={message.task_id} attachments={message.attachments ?? []} />
     <div class:markdown-content={message.role === "assistant"} class="message-content">
       {#if message.role === "assistant"}
         {@html renderMarkdown(message.content)}
