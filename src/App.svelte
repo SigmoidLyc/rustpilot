@@ -15,6 +15,7 @@
     deleteTask,
     getSettings,
     getTask,
+    getTaskEvents,
     isTauriRuntime,
     listArchivedTasks,
     listTasks,
@@ -28,6 +29,7 @@
   import { serializeFiles } from "./lib/attachments";
   import type {
     AgentStep,
+    AssistantPart,
     AttachmentPathInput,
     ApprovalRequest,
     SettingsInput,
@@ -40,6 +42,8 @@
     TaskCompletedEvent,
     TaskFailedEvent,
     TaskCancelledEvent,
+    TaskEvent,
+    PersistedStreamEvent,
     ToolCall,
     ToolResult
   } from "./lib/types";
@@ -67,8 +71,10 @@
   let approvalBusy = false;
   let actionError = "";
   let runtimeError = "";
-  let pollTimer: ReturnType<typeof setInterval> | undefined;
-  let pollInFlight = false;
+  const eventCursors = new Map<string, number>();
+  let syncingTaskId: string | null = null;
+  let bufferedEvents: TaskEvent[] = [];
+  let syncGeneration = 0;
 
   $: selectedStatus = selectedTask?.status ?? "idle";
   $: taskIsBusy =
@@ -101,9 +107,11 @@
     tasks = [summary, ...next].sort((left, right) => right.updated_at - left.updated_at);
   }
 
-  function setSelectedTask(task: Task): void {
+  function setSelectedTask(task: Task, resetCursor = false): void {
     selectedTaskId = task.id;
     selectedTask = task;
+    const knownCursor = eventCursors.get(task.id) ?? 0;
+    eventCursors.set(task.id, resetCursor ? task.event_seq : Math.max(knownCursor, task.event_seq));
     upsertSummary(summaryForTask(task));
   }
 
@@ -187,11 +195,25 @@
       updateSelected((task) => ({
         ...task,
         status: "waiting_approval",
-        approval_requests: [...task.approval_requests, request],
+        approval_requests: task.approval_requests.some((item) => item.id === request.id)
+          ? task.approval_requests.map((item) => (item.id === request.id ? request : item))
+          : [...task.approval_requests, request],
         updated_at: Date.now()
       }));
       pendingApproval = request;
     }
+  }
+
+  function handleApprovalUpdated(request: ApprovalRequest): void {
+    if (selectedTask?.id !== request.task_id) return;
+    updateSelected((task) => ({
+      ...task,
+      approval_requests: task.approval_requests.map((item) =>
+        item.id === request.id ? request : item
+      ),
+      updated_at: Date.now()
+    }));
+    pendingApproval = request.status === "pending" ? request : null;
   }
 
   function handleCompleted(event: TaskCompletedEvent): void {
@@ -226,6 +248,26 @@
     if (existing) upsertSummary({ ...existing, status: "cancelled", updated_at: Date.now() });
   }
 
+  function handleTaskSummary(summary: TaskSummary): void {
+    upsertSummary(summary);
+    if (selectedTask?.id === summary.id) {
+      if (summary.archived) newTask();
+      else {
+        updateSelected((task) => ({
+          ...task,
+          archived: false,
+          updated_at: summary.updated_at
+        }));
+      }
+    }
+  }
+
+  function handleTaskDeleted(summary: TaskSummary): void {
+    tasks = tasks.filter((task) => task.id !== summary.id);
+    archivedTasks = archivedTasks.filter((task) => task.id !== summary.id);
+    if (selectedTaskId === summary.id) newTask();
+  }
+
   function handlePlan(event: TaskPlanEvent): void {
     if (selectedTask?.id !== event.task_id) return;
     updateSelected((task) => {
@@ -234,6 +276,200 @@
         : [...task.plans, event.plan];
       return { ...task, plans, active_plan_id: event.plan.id, updated_at: event.plan.updated_at };
     });
+  }
+
+  function createStreamingMessage(taskId: string, messageId: string): TaskMessage {
+    return {
+      id: messageId,
+      task_id: taskId,
+      role: "assistant",
+      content: "",
+      created_at: Date.now(),
+      streaming: true,
+      parts: [],
+      tool_calls: [],
+      tool_call_id: null,
+      name: null,
+      base64_image: null,
+      attachments: []
+    };
+  }
+
+  function reduceStreamMessage(message: TaskMessage, event: PersistedStreamEvent): TaskMessage {
+    const next: TaskMessage = {
+      ...message,
+      streaming: true,
+      parts: [...(message.parts ?? [])]
+    };
+    if (event.kind === "text_delta" && event.delta) {
+      const parts = next.parts ?? [];
+      const last = parts[parts.length - 1];
+      const start = last?.type === "text" ? last.end : next.content.length;
+      const end = start + event.delta.length;
+      next.content += event.delta;
+      if (last?.type === "text" && last.end === start) {
+        parts[parts.length - 1] = { ...last, end };
+      } else {
+        parts.push({
+          type: "text",
+          id: `${next.id}:text:${start}`,
+          start,
+          end
+        });
+      }
+      next.parts = parts;
+      return next;
+    }
+    if (event.kind !== "tool_call_delta") return next;
+    const parts = next.parts ?? [];
+    const callId = event.id ?? "";
+    const part = parts.find(
+      (item): item is Extract<AssistantPart, { type: "tool" }> =>
+        item.type === "tool" && item.index === event.index
+    );
+    if (part) {
+      const nextCallId = callId
+        ? part.call_id.startsWith("stream:")
+          ? callId
+          : part.call_id === callId || part.call_id.endsWith(callId)
+            ? part.call_id
+            : `${part.call_id}${callId}`
+        : part.call_id;
+      part.call_id = nextCallId;
+      if (event.name) part.name += event.name;
+    } else {
+      parts.push({
+        type: "tool",
+        id: `${next.id}:tool:${event.index}`,
+        index: event.index,
+        call_id: callId || `stream:${event.index}`,
+        name: event.name ?? ""
+      });
+    }
+    next.parts = parts;
+    return next;
+  }
+
+  function applyStreamTaskEvent(event: TaskEvent): void {
+    if (!selectedTask || selectedTask.id !== event.task_id || !event.message_id) return;
+    const streamEvent = event.payload as PersistedStreamEvent;
+    if (!streamEvent || typeof streamEvent.kind !== "string") return;
+    const messages = [...selectedTask.messages];
+    const index = messages.findIndex((message) => message.id === event.message_id);
+    const current = index >= 0 ? messages[index] : createStreamingMessage(event.task_id, event.message_id);
+    const next = reduceStreamMessage(current, streamEvent);
+    if (index >= 0) messages[index] = next;
+    else messages.push(next);
+    updateSelected((task) => ({ ...task, messages, event_seq: event.seq, updated_at: Date.now() }));
+  }
+
+  function applyTaskEventNow(event: TaskEvent): void {
+    const cursor = eventCursors.get(event.task_id) ?? 0;
+    if (event.seq <= cursor) return;
+    eventCursors.set(event.task_id, event.seq);
+    if (event.kind === "stream") {
+      applyStreamTaskEvent(event);
+      return;
+    }
+    switch (event.event) {
+      case "task_created": {
+        const task = event.payload as Task;
+        upsertSummary(summaryForTask(task));
+        if (selectedTask?.id === task.id && selectedTask.messages.length === 0) {
+          setSelectedTask(task);
+        }
+        break;
+      }
+      case "task_status":
+        handleStatus(event.payload as TaskStatusEvent);
+        break;
+      case "task_message":
+        replaceMessage(event.payload as TaskMessage);
+        break;
+      case "task_step":
+        replaceStep(event.payload as AgentStep);
+        break;
+      case "task_tool_call":
+        replaceToolCall(event.payload as ToolCall);
+        break;
+      case "task_tool_result":
+        replaceToolResult(event.payload as ToolResult);
+        break;
+      case "task_approval_required":
+        handleApproval(event.payload as ApprovalRequest);
+        break;
+      case "task_approval_updated":
+        handleApprovalUpdated(event.payload as ApprovalRequest);
+        break;
+      case "task_completed":
+        handleCompleted(event.payload as TaskCompletedEvent);
+        break;
+      case "task_failed":
+        handleFailed(event.payload as TaskFailedEvent);
+        break;
+      case "task_cancelled":
+        handleCancelled(event.payload as TaskCancelledEvent);
+        break;
+      case "task_summary":
+        handleTaskSummary(event.payload as TaskSummary);
+        break;
+      case "task_deleted":
+        handleTaskDeleted(event.payload as TaskSummary);
+        break;
+      case "task_plan":
+        handlePlan(event.payload as TaskPlanEvent);
+        break;
+    }
+    if (selectedTask?.id === event.task_id) {
+      updateSelected((task) => ({ ...task, event_seq: event.seq }));
+    }
+  }
+
+  function handleTaskEvent(event: TaskEvent): void {
+    if (syncingTaskId === event.task_id) {
+      bufferedEvents = [...bufferedEvents, event];
+      return;
+    }
+    applyTaskEventNow(event);
+  }
+
+  async function syncTask(taskId: string): Promise<void> {
+    const generation = ++syncGeneration;
+    syncingTaskId = taskId;
+    bufferedEvents = [];
+    try {
+      let page = await getTaskEvents(taskId);
+      if (generation !== syncGeneration) return;
+      if (page.snapshot) {
+        setSelectedTask(page.snapshot, true);
+      }
+      while (true) {
+        for (const event of page.events) applyTaskEventNow(event);
+        if (!page.has_more) break;
+        page = await getTaskEvents(taskId, eventCursors.get(taskId) ?? page.cursor);
+        if (generation !== syncGeneration) return;
+      }
+      const pending = bufferedEvents
+        .filter((event) => event.task_id === taskId)
+        .sort((left, right) => left.seq - right.seq);
+      syncingTaskId = null;
+      bufferedEvents = [];
+      for (const event of pending) applyTaskEventNow(event);
+      if (selectedTask?.id === taskId) {
+        pendingApproval =
+          selectedTask.status === "waiting_approval"
+            ? selectedTask.approval_requests.find((request) => request.status === "pending") ?? null
+            : null;
+      }
+    } catch {
+      syncingTaskId = null;
+      bufferedEvents = [];
+      try {
+        setSelectedTask(await getTask(taskId), true);
+      } catch {
+        // The task may have been deleted while the window was reconnecting.
+      }
+    }
   }
 
   async function hydrate(): Promise<void> {
@@ -255,26 +491,6 @@
     }
   }
 
-  async function refreshSelectedTask(): Promise<void> {
-    if (!isTauriRuntime || !selectedTaskId || pollInFlight) return;
-    pollInFlight = true;
-    try {
-      const task = await getTask(selectedTaskId);
-      setSelectedTask(task);
-      if (task.status === "waiting_approval") {
-        pendingApproval =
-          task.approval_requests.find((request) => request.status === "pending") ?? null;
-      } else if (pendingApproval?.task_id === task.id) {
-        pendingApproval = null;
-      }
-    } catch {
-      // The event stream may disappear while the app is closing or a task is deleted.
-      // Keep the current view; the next poll or an explicit selection will recover it.
-    } finally {
-      pollInFlight = false;
-    }
-  }
-
   onMount(() => {
     let unlisten: (() => void)[] = [];
     let disposed = false;
@@ -283,35 +499,25 @@
         await hydrate();
         if (disposed) return;
         unlisten = await subscribeToEvents({
-          task_created: handleCreated,
-          task_status: handleStatus,
-          task_message: replaceMessage,
-          task_step: replaceStep,
-          task_tool_call: replaceToolCall,
-          task_tool_result: replaceToolResult,
-          task_approval_required: handleApproval,
-          task_completed: handleCompleted,
-          task_failed: handleFailed,
-          task_cancelled: handleCancelled,
-          task_plan: handlePlan
+          task_event: handleTaskEvent
         });
-        if (!disposed) await refreshSelectedTask();
       } catch (error) {
         runtimeError = error instanceof Error ? error.message : String(error);
       }
     };
     void initialize();
-    pollTimer = setInterval(() => {
-      if (!disposed) void refreshSelectedTask();
-    }, 650);
     return () => {
       disposed = true;
-      if (pollTimer) clearInterval(pollTimer);
+      syncGeneration += 1;
+      syncingTaskId = null;
       unlisten.forEach((remove) => remove());
     };
   });
 
   function newTask(): void {
+    syncGeneration += 1;
+    syncingTaskId = null;
+    bufferedEvents = [];
     selectedTask = null;
     selectedTaskId = "";
     pendingApproval = null;
@@ -338,6 +544,7 @@
         ? await continueTask(selectedTask.id, prompt, attachments, paths)
         : await createTask(prompt, attachments, paths);
       handleCreated(task);
+      await syncTask(task.id);
       return true;
     } catch (error) {
       actionError = error instanceof Error ? error.message : String(error);
@@ -360,6 +567,7 @@
     try {
       const task = await retryTask(selectedTask.id);
       setSelectedTask(task);
+      await syncTask(task.id);
     } catch (error) {
       actionError = error instanceof Error ? error.message : String(error);
     }
@@ -367,11 +575,7 @@
 
   async function selectTask(taskId: string): Promise<void> {
     actionError = "";
-    try {
-      setSelectedTask(await getTask(taskId));
-    } catch (error) {
-      actionError = error instanceof Error ? error.message : String(error);
-    }
+    await syncTask(taskId);
   }
 
   async function archiveProject(taskId: string): Promise<void> {

@@ -505,7 +505,7 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
         .and_then(|value| value.split_once(',').map(|(_, data)| data))
         .unwrap_or(value)
         .trim();
-    if encoded.is_empty() || encoded.len() % 4 != 0 {
+    if encoded.is_empty() || !encoded.len().is_multiple_of(4) {
         return Err("invalid Base64 length".to_string());
     }
     let padding = encoded

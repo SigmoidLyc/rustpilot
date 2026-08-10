@@ -32,18 +32,13 @@ const LLM_MAX_ATTEMPTS: usize = 3;
 const LLM_RETRY_DELAY_SECS: u64 = 5;
 const MAX_PROVIDER_DETAIL_CHARS: usize = 4096;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptCacheMode {
+    #[default]
     Auto,
     Enabled,
     Disabled,
-}
-
-impl Default for PromptCacheMode {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl PromptCacheMode {
@@ -1886,12 +1881,14 @@ mod tests {
 
     #[test]
     fn prompt_cache_adds_openai_key_and_stream_usage_without_local_state() {
-        let mut settings = LlmSettings::default();
-        settings.model = "cache-test-openai".to_string();
-        settings.base_url = "https://api.openai.test/v1".to_string();
-        settings.api_key = "test-key".to_string();
-        settings.session_id = Some("rustpilot:task-1".to_string());
-        settings.tool_schema_hash = Some("0123456789abcdef".to_string());
+        let settings = LlmSettings {
+            model: "cache-test-openai".to_string(),
+            base_url: "https://api.openai.test/v1".to_string(),
+            api_key: "test-key".to_string(),
+            session_id: Some("rustpilot:task-1".to_string()),
+            tool_schema_hash: Some("0123456789abcdef".to_string()),
+            ..Default::default()
+        };
         let client = OpenAiCompatibleClient::new(settings).unwrap();
         let body = client.request_body(
             &[json!({"role": "system", "content": "stable"})],
@@ -1924,10 +1921,12 @@ mod tests {
 
     #[test]
     fn prompt_cache_disabled_does_not_change_wire_body() {
-        let mut settings = LlmSettings::default();
-        settings.model = "cache-test-disabled".to_string();
-        settings.prompt_cache = PromptCacheMode::Disabled;
-        settings.session_id = Some("rustpilot:task-2".to_string());
+        let settings = LlmSettings {
+            model: "cache-test-disabled".to_string(),
+            prompt_cache: PromptCacheMode::Disabled,
+            session_id: Some("rustpilot:task-2".to_string()),
+            ..Default::default()
+        };
         let client = OpenAiCompatibleClient::new(settings).unwrap();
         let body = client.request_body(
             &[json!({"role": "system", "content": "stable"})],
@@ -1943,11 +1942,13 @@ mod tests {
 
     #[test]
     fn openrouter_breakpoints_match_opencode_message_selection() {
-        let mut settings = LlmSettings::default();
-        settings.model = "cache-test-openrouter".to_string();
-        settings.base_url = "https://openrouter.ai/api/v1".to_string();
-        settings.api_type = "openrouter".to_string();
-        settings.session_id = Some("rustpilot:task-3".to_string());
+        let settings = LlmSettings {
+            model: "cache-test-openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            api_type: "openrouter".to_string(),
+            session_id: Some("rustpilot:task-3".to_string()),
+            ..Default::default()
+        };
         let client = OpenAiCompatibleClient::new(settings).unwrap();
         let messages = vec![
             json!({"role": "system", "content": "system-1"}),

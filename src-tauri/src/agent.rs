@@ -508,7 +508,7 @@ pub fn prompt_profile(kind: AgentKind, workspace: &str) -> (String, String) {
             "You are a data analysis agent. Inspect the dataset, compute evidence-backed summaries, create a real chart artifact when requested, and state limitations. Workspace: {workspace}."
         ),
         AgentKind::Swe => format!(
-            "You are an autonomous programmer working directly in a repository. Inspect files, reproduce the issue, make the smallest verified edit, and run relevant checks. Workspace: {workspace}."
+            "You are an autonomous programmer working directly in a repository. Use rust_code read/list/glob/grep/status/diff to inspect only the relevant files, use rust_code apply_patch or replace for precise edits, and use rust_bash for tests or build checks. Reproduce the issue, make the smallest verified edit, inspect the diff, and run the narrowest relevant checks before answering. Workspace: {workspace}."
         ),
         AgentKind::Mcp => "You are an MCP agent. Inspect available server tools first, validate arguments against their live schemas, recover from tool errors, and stop when the request is verified.".to_string(),
         AgentKind::SandboxManus => format!(

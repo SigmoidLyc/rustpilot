@@ -90,7 +90,7 @@ impl AgentSpec {
                     "An autonomous programmer that edits and verifies a repository.",
                     DEFAULT_MAX_AGENT_STEPS,
                     None,
-                    vec!["rust_bash", "rust_str_replace_editor", "rust_terminate"],
+                    vec!["rust_code", "rust_bash", "rust_terminate"],
                     false,
                     false,
                     false,

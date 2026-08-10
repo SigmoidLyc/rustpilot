@@ -184,6 +184,34 @@ export interface Task {
   llm_usage: LlmUsage;
   final_answer: string | null;
   error: string | null;
+  event_seq: number;
+}
+
+export type PersistedStreamEvent =
+  | { kind: "text_delta"; delta: string }
+  | {
+      kind: "tool_call_delta";
+      index: number;
+      id: string | null;
+      name: string | null;
+    };
+
+export interface TaskEvent {
+  task_id: string;
+  seq: number;
+  kind: "task" | "stream";
+  event: string | null;
+  message_id: string | null;
+  payload: unknown;
+}
+
+export interface TaskEventPage {
+  task_id: string;
+  snapshot: Task | null;
+  events: TaskEvent[];
+  cursor: number;
+  has_more: boolean;
+  reset: boolean;
 }
 
 export interface TaskSummary {

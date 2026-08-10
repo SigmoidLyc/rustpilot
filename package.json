@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "tauri:dev": "node scripts/tauri-dev.mjs",
     "tauri:build": "tauri build --bundles nsis",
-    "tauri:build:all": "tauri build --bundles all"
+    "tauri:build:all": "tauri build --bundles all",
+    "size:check": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-release-size.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "2.8.0",
