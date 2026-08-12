@@ -4,7 +4,10 @@
 
   export let request: ApprovalRequest | null = null;
   export let busy = false;
-  export let onDecision: (approved: boolean) => void;
+  export let onDecision: (approved: boolean, remember?: boolean) => void;
+  let remember = false;
+
+  $: if (request?.id) remember = false;
 </script>
 
 {#if request}
@@ -20,12 +23,18 @@
         <summary>Tool arguments</summary>
         <pre>{request.details}</pre>
       </details>
+      {#if request.rememberable}
+        <label class="approval-remember">
+          <input bind:checked={remember} type="checkbox" disabled={busy} />
+          <span>Remember this kind of action for this workspace</span>
+        </label>
+      {/if}
       <div class="dialog-actions">
         <button class="secondary-button" type="button" disabled={busy} on:click={() => onDecision(false)}>
           <X size={16} />
           Decline
         </button>
-        <button class="primary-button" type="button" disabled={busy} on:click={() => onDecision(true)}>
+        <button class="primary-button" type="button" disabled={busy} on:click={() => onDecision(true, remember)}>
           <Check size={16} />
           {busy ? "Sending..." : "Approve"}
         </button>

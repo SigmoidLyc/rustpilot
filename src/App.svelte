@@ -19,6 +19,12 @@
     isTauriRuntime,
     listArchivedTasks,
     listTasks,
+    listProjects,
+    listRecentProjects,
+    openProject,
+    pickProject,
+    closeProject,
+    touchProject,
     respondToApproval,
     restoreTask,
     retryTask,
@@ -31,6 +37,7 @@
     AgentStep,
     AssistantPart,
     AttachmentPathInput,
+    ApprovalMode,
     ApprovalRequest,
     SettingsInput,
     SettingsView,
@@ -39,6 +46,7 @@
     TaskPlanEvent,
     TaskStatusEvent,
     TaskSummary,
+    ProjectSummary,
     TaskCompletedEvent,
     TaskFailedEvent,
     TaskCancelledEvent,
@@ -55,12 +63,17 @@
     max_steps: 100,
     timeout_secs: 45,
     prompt_cache: "auto",
+    approval_mode: "guarded",
+    remembered_approvals: 0,
     demo_mode: true,
     available_tools: []
   };
 
   let tasks: TaskSummary[] = [];
   let archivedTasks: TaskSummary[] = [];
+  let projects: ProjectSummary[] = [];
+  let recentlyClosedProjects: ProjectSummary[] = [];
+  let selectedWorkspace = "";
   let selectedTask: Task | null = null;
   let selectedTaskId = "";
   let settings = defaultSettings;
@@ -85,6 +98,7 @@
     return {
       id: task.id,
       title: task.title,
+      workspace: task.workspace,
       status: task.status,
       updated_at: task.updated_at,
       demo_mode: task.demo_mode,
@@ -110,6 +124,7 @@
   function setSelectedTask(task: Task, resetCursor = false): void {
     selectedTaskId = task.id;
     selectedTask = task;
+    selectedWorkspace = task.workspace;
     const knownCursor = eventCursors.get(task.id) ?? 0;
     eventCursors.set(task.id, resetCursor ? task.event_seq : Math.max(knownCursor, task.event_seq));
     upsertSummary(summaryForTask(task));
@@ -478,13 +493,18 @@
       return;
     }
     try {
-      const [loadedTasks, loadedArchivedTasks, loadedSettings] = await Promise.all([
+      const [loadedTasks, loadedArchivedTasks, loadedProjects, loadedRecentProjects, loadedSettings] = await Promise.all([
         listTasks(),
         listArchivedTasks(),
+        listProjects(),
+        listRecentProjects(),
         getSettings()
       ]);
       tasks = loadedTasks;
       archivedTasks = loadedArchivedTasks;
+      projects = loadedProjects;
+      recentlyClosedProjects = loadedRecentProjects;
+      selectedWorkspace = loadedProjects[0]?.directory ?? loadedTasks[0]?.workspace ?? "";
       settings = loadedSettings;
     } catch (error) {
       runtimeError = error instanceof Error ? error.message : String(error);
@@ -524,6 +544,78 @@
     actionError = "";
   }
 
+  function newTaskInProject(directory: string): void {
+    selectedWorkspace = directory;
+    newTask();
+    selectedWorkspace = directory;
+  }
+
+  async function refreshProjects(): Promise<void> {
+    [projects, recentlyClosedProjects] = await Promise.all([listProjects(), listRecentProjects()]);
+  }
+
+  async function selectProject(directory: string): Promise<void> {
+    actionError = "";
+    try {
+      await touchProject(directory);
+      await refreshProjects();
+      selectedWorkspace = directory;
+      const task = tasks.find((item) => item.workspace === directory);
+      if (task) await syncTask(task.id);
+      else newTask();
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function openProjectPath(path: string): Promise<void> {
+    actionError = "";
+    try {
+      const project = await openProject(path);
+      await refreshProjects();
+      selectedWorkspace = project.directory;
+      const task = tasks.find((item) => item.workspace === project.directory);
+      if (task) await syncTask(task.id);
+      else newTask();
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function chooseProject(kind: "file" | "folder"): Promise<void> {
+    actionError = "";
+    try {
+      const project = await pickProject(kind);
+      if (project) {
+        await refreshProjects();
+        selectedWorkspace = project.directory;
+        const task = tasks.find((item) => item.workspace === project.directory);
+        if (task) await syncTask(task.id);
+        else newTask();
+      }
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function closeProjectPath(directory: string): Promise<void> {
+    actionError = "";
+    try {
+      await closeProject(directory);
+      await refreshProjects();
+      if (selectedWorkspace === directory) {
+        const next = projects[0];
+        if (next) await selectProject(next.directory);
+        else {
+          newTask();
+          selectedWorkspace = "";
+        }
+      }
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
   async function sendTask(
     prompt: string,
     files: File[],
@@ -542,7 +634,7 @@
       const attachments = await serializeFiles(files);
       const task = selectedTask
         ? await continueTask(selectedTask.id, prompt, attachments, paths)
-        : await createTask(prompt, attachments, paths);
+        : await createTask(prompt, attachments, paths, selectedWorkspace || undefined);
       handleCreated(task);
       await syncTask(task.id);
       return true;
@@ -645,14 +737,36 @@
     }
   }
 
-  async function decideApproval(approved: boolean): Promise<void> {
+  async function changeApprovalMode(mode: ApprovalMode): Promise<boolean> {
+    if (mode === settings.approval_mode) return true;
+    actionError = "";
+    try {
+      settings = await updateSettings({
+        api_base_url: settings.api_base_url,
+        model: settings.model,
+        api_key: null,
+        max_steps: settings.max_steps,
+        timeout_secs: settings.timeout_secs,
+        prompt_cache: settings.prompt_cache,
+        approval_mode: mode,
+        clear_approval_rules: false
+      });
+      return true;
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : String(error);
+      return false;
+    }
+  }
+
+  async function decideApproval(approved: boolean, remember = false): Promise<void> {
     if (!pendingApproval) return;
     approvalBusy = true;
     try {
       const delivered = await respondToApproval(
         pendingApproval.task_id,
         pendingApproval.id,
-        approved
+        approved,
+        remember
       );
       if (!delivered) actionError = "This approval request is no longer active.";
       pendingApproval = null;
@@ -668,10 +782,19 @@
   <div class="workspace">
     <Sidebar
       {tasks}
+      {projects}
+      recentlyClosedProjects={recentlyClosedProjects}
+      {selectedWorkspace}
       selectedTaskId={selectedTaskId}
       {archivedTasks}
       onNewTask={newTask}
+      onNewTaskInProject={newTaskInProject}
       onSelectTask={selectTask}
+      onSelectProject={selectProject}
+      onOpenProject={openProjectPath}
+      onPickProject={chooseProject}
+      onCloseProject={closeProjectPath}
+      onReopenProject={openProjectPath}
       onArchiveTask={archiveProject}
       onRestoreTask={restoreProject}
       onDeleteTask={deleteProject}
@@ -715,6 +838,8 @@
           busy={taskIsBusy}
           disabled={!isTauriRuntime}
           placeholder={settings.demo_mode ? "Configure an API key in Settings to start..." : "Describe a task..."}
+          approvalMode={settings.approval_mode}
+          onApprovalModeChange={changeApprovalMode}
           onSend={sendTask}
           onStop={stopCurrentTask}
         />

@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use crate::string_argument;
 
 #[cfg(all(target_os = "windows", not(test)))]
-use crate::{base64_encode, path_guard, workspace_root};
+use crate::{base64_encode, path_guard};
 #[cfg(all(target_os = "windows", not(test)))]
 use std::fs;
 #[cfg(all(target_os = "windows", not(test)))]
@@ -222,23 +222,24 @@ fn capture_screen_bmp() -> Result<(i32, i32, Vec<u8>), String> {
 }
 
 #[cfg(all(target_os = "windows", not(test)))]
-fn computer_snapshot(arguments: &Value, external_path_approved: bool) -> Result<String, String> {
+fn computer_snapshot(
+    arguments: &Value,
+    external_path_approved: bool,
+    workspace: &std::path::Path,
+) -> Result<String, String> {
     let mut point = WinPoint { x: 0, y: 0 };
     let cursor_ok = unsafe { GetCursorPos(&mut point) != 0 };
     let (width, height, bmp) = capture_screen_bmp()?;
     let requested_path = string_argument(arguments, "path").unwrap_or_else(|| {
-        workspace_root()
+        workspace
             .join(".rustpilot")
             .join(format!("screen-{}.bmp", Uuid::new_v4()))
             .display()
             .to_string()
     });
-    let path = path_guard::resolve_mutation_path(
-        &workspace_root(),
-        &requested_path,
-        external_path_approved,
-    )?
-    .canonical;
+    let path =
+        path_guard::resolve_mutation_path(workspace, &requested_path, external_path_approved)?
+            .canonical;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Unable to create screenshot directory: {error}"))?;
@@ -261,7 +262,11 @@ fn computer_snapshot(arguments: &Value, external_path_approved: bool) -> Result<
 }
 
 #[cfg(all(target_os = "windows", test))]
-fn computer_snapshot(_arguments: &Value, _external_path_approved: bool) -> Result<String, String> {
+fn computer_snapshot(
+    _arguments: &Value,
+    _external_path_approved: bool,
+    _workspace: &std::path::Path,
+) -> Result<String, String> {
     Ok(serde_json::to_string_pretty(&json!({
         "screenshot_available": false,
         "note": "Screen capture is disabled in the Windows GNU test binary."
@@ -270,7 +275,11 @@ fn computer_snapshot(_arguments: &Value, _external_path_approved: bool) -> Resul
 }
 
 #[cfg(not(target_os = "windows"))]
-fn computer_snapshot(_arguments: &Value, _external_path_approved: bool) -> Result<String, String> {
+fn computer_snapshot(
+    _arguments: &Value,
+    _external_path_approved: bool,
+    _workspace: &std::path::Path,
+) -> Result<String, String> {
     Ok(serde_json::to_string_pretty(&json!({
         "screenshot_available": false,
         "note": "Computer input is only available on Windows in this desktop build."
@@ -278,7 +287,11 @@ fn computer_snapshot(_arguments: &Value, _external_path_approved: bool) -> Resul
     .unwrap_or_default())
 }
 
-pub(crate) async fn run(arguments: &Value, external_path_approved: bool) -> Result<String, String> {
+pub(crate) async fn run(
+    arguments: &Value,
+    external_path_approved: bool,
+    workspace: &std::path::Path,
+) -> Result<String, String> {
     let action = string_argument(arguments, "action")
         .ok_or_else(|| "rust_computer_use requires action".to_string())?;
     if action == "wait" {
@@ -291,7 +304,7 @@ pub(crate) async fn run(arguments: &Value, external_path_approved: bool) -> Resu
         return Ok(format!("Waited for {duration:.2} seconds."));
     }
     if action == "screenshot" {
-        return computer_snapshot(arguments, external_path_approved);
+        return computer_snapshot(arguments, external_path_approved, workspace);
     }
 
     #[cfg(all(target_os = "windows", not(test)))]

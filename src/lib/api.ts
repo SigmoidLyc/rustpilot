@@ -6,6 +6,7 @@ import type {
   Task,
   TaskEvent,
   TaskEventPage,
+  ProjectSummary,
   TaskSummary,
   SettingsInput,
   SettingsView
@@ -23,18 +24,30 @@ export async function invokeRust<T>(command: string, args?: Record<string, unkno
 
 export const listTasks = () => invokeRust<TaskSummary[]>("list_tasks");
 export const listArchivedTasks = () => invokeRust<TaskSummary[]>("list_archived_tasks");
+export const listProjects = () => invokeRust<ProjectSummary[]>("list_projects");
+export const listRecentProjects = () => invokeRust<ProjectSummary[]>("list_recent_projects");
+export const openProject = (path: string) =>
+  invokeRust<ProjectSummary>("open_project", { path });
+export const pickProject = (kind: "file" | "folder") =>
+  invokeRust<ProjectSummary | null>("pick_project", { kind });
+export const closeProject = (directory: string) =>
+  invokeRust<boolean>("close_project", { directory });
+export const touchProject = (directory: string) =>
+  invokeRust<boolean>("touch_project", { directory });
 export const getTask = (taskId: string) => invokeRust<Task>("get_task", { taskId });
 export const getTaskEvents = (taskId: string, after?: number) =>
   invokeRust<TaskEventPage>("get_task_events", { taskId, after });
 export const createTask = (
   prompt: string,
   attachments: AttachmentInput[] = [],
-  paths: AttachmentPathInput[] = []
+  paths: AttachmentPathInput[] = [],
+  workspace?: string
 ) =>
   invokeRust<Task>("create_task", {
     prompt,
     attachmentInputs: attachments,
-    attachmentPaths: paths
+    attachmentPaths: paths,
+    workspace
   });
 export const continueTask = (
   taskId: string,
@@ -64,12 +77,14 @@ export const updateSettings = (input: SettingsInput) =>
 export const respondToApproval = (
   taskId: string,
   approvalId: string,
-  approved: boolean
+  approved: boolean,
+  remember = false
 ) =>
   invokeRust<boolean>("respond_to_approval", {
     taskId,
     approvalId,
-    approved
+    approved,
+    remember
   });
 
 export interface EventHandlers {

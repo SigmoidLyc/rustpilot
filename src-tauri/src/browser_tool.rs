@@ -9,8 +9,8 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::{
-    first_env_value, path_guard, string_argument, truncate_output, workspace_root, AppState,
-    BrowserSession, BrowserTab,
+    first_env_value, path_guard, string_argument, truncate_output, AppState, BrowserSession,
+    BrowserTab,
 };
 
 fn percent_encode(value: &str) -> String {
@@ -208,7 +208,7 @@ async fn load_browser_page(
     Ok(status)
 }
 
-async fn capture_browser_screenshot(url: &str) -> Result<PathBuf, String> {
+async fn capture_browser_screenshot(url: &str, workspace: &Path) -> Result<PathBuf, String> {
     let browser = first_env_value(&["RUSTPILOT_BROWSER_PATH"]).or_else(|| {
         [
             r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
@@ -222,8 +222,7 @@ async fn capture_browser_screenshot(url: &str) -> Result<PathBuf, String> {
     let Some(browser) = browser else {
         return Err("No Chromium-compatible browser executable was found.".to_string());
     };
-    let workspace = workspace_root();
-    let output_dir = path_guard::resolve_scoped_path(&workspace, ".rustpilot/browser-artifacts")?;
+    let output_dir = path_guard::resolve_scoped_path(workspace, ".rustpilot/browser-artifacts")?;
     tokio::fs::create_dir_all(&output_dir)
         .await
         .map_err(|error| format!("Unable to create browser artifact directory: {error}"))?;
@@ -433,12 +432,13 @@ pub(crate) async fn run_browser_tool(
     state: &AppState,
     arguments: &Value,
     namespace: &str,
+    workspace: &Path,
 ) -> Result<String, String> {
     let action = string_argument(arguments, "action")
         .ok_or_else(|| "rust_browser_use requires action".to_string())?;
     let raw_session_id =
         string_argument(arguments, "session_id").unwrap_or_else(|| "default".to_string());
-    let session_id = format!("{namespace}:{raw_session_id}");
+    let session_id = format!("{namespace}:{}:{raw_session_id}", workspace.display());
     let mut session = state
         .browser_sessions
         .lock()
@@ -666,7 +666,7 @@ pub(crate) async fn run_browser_tool(
             "url": session.current_url,
             "title": session.title,
             "visual_available": true,
-            "image_path": capture_browser_screenshot(&session.current_url).await?.display().to_string()
+            "image_path": capture_browser_screenshot(&session.current_url, workspace).await?.display().to_string()
         }))
         .map_err(|error| format!("Unable to encode browser state: {error}")),
         _ => Err(format!("Unsupported browser action: {action}")),

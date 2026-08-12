@@ -152,6 +152,9 @@ export interface ApprovalRequest {
   details: string;
   created_at: number;
   status: string;
+  rememberable: boolean;
+  remember_action: string | null;
+  remember_pattern: string | null;
 }
 
 export interface LlmUsage {
@@ -167,6 +170,7 @@ export interface Task {
   id: string;
   title: string;
   prompt: string;
+  workspace: string;
   status: AgentStatus;
   created_at: number;
   updated_at: number;
@@ -217,11 +221,21 @@ export interface TaskEventPage {
 export interface TaskSummary {
   id: string;
   title: string;
+  workspace: string;
   status: AgentStatus;
   updated_at: number;
   demo_mode: boolean;
   archived: boolean;
   error: string | null;
+}
+
+export interface ProjectSummary {
+  id: string;
+  directory: string;
+  name: string;
+  created_at: number;
+  updated_at: number;
+  task_count: number;
 }
 
 export interface TaskStatusEvent {
@@ -258,11 +272,14 @@ export interface SettingsView {
   max_steps: number;
   timeout_secs: number;
   prompt_cache: PromptCacheMode;
+  approval_mode: ApprovalMode;
+  remembered_approvals: number;
   demo_mode: boolean;
   available_tools: AgentToolDefinition[];
 }
 
 export type PromptCacheMode = "auto" | "enabled" | "disabled";
+export type ApprovalMode = "confirm" | "guarded";
 
 export interface SettingsInput {
   api_base_url: string;
@@ -271,6 +288,8 @@ export interface SettingsInput {
   max_steps: number;
   timeout_secs: number;
   prompt_cache: PromptCacheMode;
+  approval_mode: ApprovalMode;
+  clear_approval_rules: boolean;
 }
 
 export type AgentEventPayload =

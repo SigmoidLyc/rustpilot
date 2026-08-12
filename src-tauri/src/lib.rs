@@ -44,6 +44,7 @@ pub(crate) mod mcp_tool;
 mod mcp_transport;
 mod models;
 pub(crate) mod planning_tool;
+mod project_store;
 pub(crate) mod runtime_tool;
 pub(crate) mod shell_tool;
 mod tool_catalog;
@@ -62,16 +63,21 @@ use models::{
 };
 pub use models::{
     AgentMemoryEntry, AgentPlan, AgentPlanStep, AgentSettings, AgentStatus, AgentStep,
-    AgentToolDefinition, ApprovalRequest, AssistantPart, PlanStepStatus, SettingsInput,
-    SettingsView, StepPhase, StepStatus, Task, TaskCancelledEvent, TaskCompletedEvent,
-    TaskFailedEvent, TaskMessage, TaskPlanEvent, TaskStatusEvent, TaskSummary, ToolCall,
-    ToolCallStatus, ToolResult,
+    AgentToolDefinition, ApprovalMode, ApprovalRequest, ApprovalRule, AssistantPart,
+    PlanStepStatus, ProjectSummary, SettingsInput, SettingsView, StepPhase, StepStatus, Task,
+    TaskCancelledEvent, TaskCompletedEvent, TaskFailedEvent, TaskMessage, TaskPlanEvent,
+    TaskStatusEvent, TaskSummary, ToolCall, ToolCallStatus, ToolResult,
 };
 #[cfg(test)]
 use planning_tool::format_plan;
 #[cfg(test)]
 use tool_catalog::tool_definitions;
-use tool_policy::{approval_details, approval_reason, is_high_risk};
+#[cfg(test)]
+use tool_policy::is_high_risk;
+use tool_policy::{
+    approval_details, approval_reason, external_path_requested, needs_approval, rule_for,
+    sanitize_rules,
+};
 #[cfg(test)]
 use tool_registry::tool_schema_hash;
 use tool_registry::{
@@ -83,6 +89,8 @@ const MAX_OUTPUT_CHARS: usize = 16_000;
 const MAX_MEMORY_ENTRIES: usize = 100;
 const APPROVAL_TIMEOUT_SECS: u64 = 300;
 const API_KEY_REQUIRED_MESSAGE: &str = "Configure an API key in Settings before sending a task.";
+const INTERNAL_WORKSPACE_ARGUMENT: &str = "_rustpilot_workspace";
+pub(crate) const INTERNAL_ATTACHMENT_READ_PATHS_ARGUMENT: &str = "_rustpilot_attachment_read_paths";
 
 pub(crate) fn ensure_writable_directory(
     preferred: PathBuf,
@@ -147,9 +155,11 @@ pub struct AppState {
     event_cursors: Arc<RwLock<HashMap<String, i64>>>,
     event_floors: Arc<RwLock<HashMap<String, i64>>>,
     running: Arc<RwLock<HashMap<String, CancellationToken>>>,
-    approval_waiters: Arc<RwLock<HashMap<String, oneshot::Sender<bool>>>>,
+    approval_waiters: Arc<RwLock<HashMap<String, ApprovalWaiter>>>,
     settings: Arc<RwLock<AgentSettings>>,
     storage_dir: Arc<RwLock<Option<PathBuf>>>,
+    projects: Arc<RwLock<project_store::ProjectStore>>,
+    project_store_path: Arc<RwLock<Option<PathBuf>>>,
     persist_lock: Arc<Mutex<()>>,
     edit_history: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
     shell_sessions: Arc<AsyncMutex<HashMap<String, PersistentShell>>>,
@@ -158,6 +168,11 @@ pub struct AppState {
     mcp_tools: Arc<RwLock<HashMap<String, McpToolDefinition>>>,
     mcp_tools_revision: Arc<AtomicU64>,
     tool_definition_cache: ToolDefinitionCache,
+}
+
+struct ApprovalWaiter {
+    task_id: String,
+    sender: oneshot::Sender<bool>,
 }
 
 impl AppState {
@@ -171,6 +186,8 @@ impl AppState {
             approval_waiters: Arc::new(RwLock::new(HashMap::new())),
             settings: Arc::new(RwLock::new(default_settings())),
             storage_dir: Arc::new(RwLock::new(None)),
+            projects: Arc::new(RwLock::new(project_store::ProjectStore::default())),
+            project_store_path: Arc::new(RwLock::new(None)),
             persist_lock: Arc::new(Mutex::new(())),
             edit_history: Arc::new(Mutex::new(HashMap::new())),
             shell_sessions: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -198,6 +215,23 @@ impl AppState {
                 .write()
                 .map_err(|_| "Storage lock is poisoned".to_string())?;
             *storage_dir = Some(data_dir.clone());
+        }
+        let projects_path = data_dir.join(project_store::PROJECTS_FILE);
+        let loaded_projects = project_store::ProjectStore::load(&projects_path);
+        let migrate_projects = loaded_projects.is_none();
+        {
+            let mut projects = self
+                .projects
+                .write()
+                .map_err(|_| "Project lock is poisoned".to_string())?;
+            *projects = loaded_projects.unwrap_or_default();
+        }
+        {
+            let mut path = self
+                .project_store_path
+                .write()
+                .map_err(|_| "Project storage lock is poisoned".to_string())?;
+            *path = Some(projects_path);
         }
 
         let settings_path = data_dir.join(SETTINGS_FILE);
@@ -230,6 +264,10 @@ impl AppState {
             if let Some(prompt_cache) = persisted_settings.prompt_cache {
                 settings.prompt_cache = prompt_cache;
             }
+            if let Some(approval_mode) = persisted_settings.approval_mode {
+                settings.approval_mode = approval_mode;
+            }
+            settings.approval_rules = sanitize_rules(persisted_settings.approval_rules);
             if let Some(api_base_url) = first_env_value(&["RUSTPILOT_API_BASE_URL"]) {
                 settings.api_base_url = api_base_url.trim_end_matches('/').to_string();
             }
@@ -291,6 +329,35 @@ impl AppState {
                     repaired_task_ids.push(task_id.clone());
                 }
                 tasks.insert(task.id.clone(), task.clone());
+            }
+        }
+
+        {
+            let mut projects = self
+                .projects
+                .write()
+                .map_err(|_| "Project lock is poisoned".to_string())?;
+            let mut changed = false;
+            if migrate_projects {
+                // Pre-project-store task history had no explicit open/closed state.
+                // Seed it once, then preserve user close decisions across restarts.
+                let timestamp = now();
+                let current = workspace_root();
+                if current.is_dir() {
+                    changed |= projects.open(&current, timestamp);
+                }
+                let mut task_workspaces = loaded_tasks
+                    .values()
+                    .filter(|task| Path::new(&task.workspace).is_dir())
+                    .collect::<Vec<_>>();
+                task_workspaces.sort_by_key(|task| Reverse(task.updated_at));
+                for task in task_workspaces {
+                    changed |= projects.open(Path::new(&task.workspace), timestamp);
+                }
+            }
+            drop(projects);
+            if changed {
+                self.persist_projects()?;
             }
         }
 
@@ -393,11 +460,34 @@ impl AppState {
             max_steps: Some(settings.max_steps),
             timeout_secs: Some(settings.timeout_secs),
             prompt_cache: Some(settings.prompt_cache),
+            approval_mode: Some(settings.approval_mode),
+            approval_rules: settings.approval_rules.clone(),
         };
         let contents = serde_json::to_string_pretty(&safe_settings)
             .map_err(|error| format!("Unable to encode settings: {error}"))?;
         fs::write(data_dir.join(SETTINGS_FILE), contents)
             .map_err(|error| format!("Unable to persist settings: {error}"))
+    }
+
+    fn persist_projects(&self) -> Result<(), String> {
+        let path = self
+            .project_store_path
+            .read()
+            .map_err(|_| "Project storage lock is poisoned".to_string())?
+            .clone();
+        let Some(path) = path else {
+            return Ok(());
+        };
+        let projects = self
+            .projects
+            .read()
+            .map_err(|_| "Project lock is poisoned".to_string())?
+            .clone();
+        let _guard = self
+            .persist_lock
+            .lock()
+            .map_err(|_| "Persistence lock is poisoned".to_string())?;
+        project_store::persist(&path, &projects)
     }
 }
 
@@ -427,6 +517,8 @@ fn default_settings() -> AgentSettings {
         max_steps: agent::DEFAULT_MAX_AGENT_STEPS,
         timeout_secs: 45,
         prompt_cache: llm::PromptCacheMode::Auto,
+        approval_mode: ApprovalMode::Guarded,
+        approval_rules: Vec::new(),
     }
 }
 
@@ -858,6 +950,11 @@ fn clear_streaming_message_flags(messages: &mut [TaskMessage]) -> bool {
 
 fn repair_task_record(task: &mut Task) -> bool {
     let mut changed = clear_streaming_message_flags(&mut task.messages);
+    let workspace = normalized_task_workspace(&task.workspace);
+    if task.workspace != workspace {
+        task.workspace = workspace;
+        changed = true;
+    }
     let source = if task.memory.is_empty() {
         let recovered = memory_from_task_messages(&task.messages);
         if recovered.is_empty() && !task.prompt.trim().is_empty() {
@@ -898,6 +995,81 @@ fn repair_task_record(task: &mut Task) -> bool {
     } else {
         false
     }
+}
+
+fn normalized_task_workspace(raw: &str) -> String {
+    let fallback = workspace_root();
+    let requested = if raw.trim().is_empty() {
+        fallback
+    } else {
+        PathBuf::from(raw)
+    };
+    let resolved = requested
+        .canonicalize()
+        .ok()
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(workspace_root);
+    project_store::display_directory(&resolved)
+}
+
+fn task_workspace(task: &Task) -> PathBuf {
+    PathBuf::from(&task.workspace)
+}
+
+pub(crate) fn workspace_root_for_arguments(arguments: &Value) -> PathBuf {
+    arguments
+        .get(INTERNAL_WORKSPACE_ARGUMENT)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(workspace_root)
+}
+
+fn task_attachment_read_paths(state: &AppState, task: &Task) -> Result<Vec<String>, String> {
+    let attachments = task
+        .messages
+        .iter()
+        .flat_map(|message| message.attachments.iter())
+        .collect::<Vec<_>>();
+    if attachments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let data_dir = attachment_data_directory(state)?;
+    attachments
+        .into_iter()
+        .map(|attachment| {
+            attachments::read_path(&data_dir, attachment)
+                .map(|path| path.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+fn with_task_workspace(
+    arguments: &Value,
+    workspace: &Path,
+    attachment_read_paths: &[String],
+) -> Value {
+    let mut enriched = arguments.clone();
+    if let Some(object) = enriched.as_object_mut() {
+        object.insert(
+            INTERNAL_WORKSPACE_ARGUMENT.to_string(),
+            Value::String(workspace.display().to_string()),
+        );
+        object.remove(INTERNAL_ATTACHMENT_READ_PATHS_ARGUMENT);
+        if !attachment_read_paths.is_empty() {
+            object.insert(
+                INTERNAL_ATTACHMENT_READ_PATHS_ARGUMENT.to_string(),
+                Value::Array(
+                    attachment_read_paths
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+        }
+    }
+    enriched
 }
 
 fn repair_task_memory(state: &AppState, task_id: &str) -> Result<Vec<AgentMemoryEntry>, String> {
@@ -1740,6 +1912,7 @@ async fn wait_for_approval(
     cancel: &CancellationToken,
 ) -> Result<ApprovalOutcome, AgentError> {
     let approval_id = new_id("approval");
+    let remembered_rule = rule_for(tool_name, arguments);
     let request = ApprovalRequest {
         id: approval_id.clone(),
         task_id: task_id.to_string(),
@@ -1748,16 +1921,38 @@ async fn wait_for_approval(
         details: approval_details(tool_name, arguments),
         created_at: now(),
         status: "pending".to_string(),
+        rememberable: remembered_rule.is_some(),
+        remember_action: remembered_rule.as_ref().map(|rule| rule.action.clone()),
+        remember_pattern: remembered_rule.map(|rule| rule.resource),
     };
     let (sender, receiver) = oneshot::channel();
     state
         .approval_waiters
         .write()
         .map_err(|_| AgentError::Message("Approval lock is poisoned".to_string()))?
-        .insert(approval_id.clone(), sender);
-    set_status(app, state, task_id, AgentStatus::WaitingApproval, None)
-        .map_err(AgentError::Message)?;
-    add_approval_request(app, state, request).map_err(AgentError::Message)?;
+        .insert(
+            approval_id.clone(),
+            ApprovalWaiter {
+                task_id: task_id.to_string(),
+                sender,
+            },
+        );
+    set_status(app, state, task_id, AgentStatus::WaitingApproval, None).map_err(|error| {
+        state
+            .approval_waiters
+            .write()
+            .ok()
+            .map(|mut waiters| waiters.remove(&approval_id));
+        AgentError::Message(error)
+    })?;
+    if let Err(error) = add_approval_request(app, state, request) {
+        state
+            .approval_waiters
+            .write()
+            .ok()
+            .map(|mut waiters| waiters.remove(&approval_id));
+        return Err(AgentError::Message(error));
+    }
 
     let decision = tokio::select! {
         _ = cancel.cancelled() => {
@@ -1835,16 +2030,15 @@ fn workspace_root() -> PathBuf {
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn sandbox_root_for_task(task_id: &str) -> Result<PathBuf, String> {
-    let workspace = workspace_root();
+fn sandbox_root_for_task(task_id: &str, workspace: &Path) -> Result<PathBuf, String> {
     let requested = format!(".rustpilot/sandboxes/{task_id}");
-    let root = path_guard::resolve_scoped_path(&workspace, &requested)?;
+    let root = path_guard::resolve_scoped_path(workspace, &requested)?;
     fs::create_dir_all(&root).map_err(|error| format!("Unable to create task sandbox: {error}"))?;
-    path_guard::resolve_scoped_path(&workspace, &root.to_string_lossy())
+    path_guard::resolve_scoped_path(workspace, &root.to_string_lossy())
 }
 
-fn sandbox_path_for_task(task_id: &str, raw: &str) -> Result<PathBuf, String> {
-    let root = sandbox_root_for_task(task_id)?;
+fn sandbox_path_for_task(task_id: &str, raw: &str, workspace: &Path) -> Result<PathBuf, String> {
+    let root = sandbox_root_for_task(task_id, workspace)?;
     path_guard::resolve_scoped_path(&root, raw)
 }
 
@@ -1885,11 +2079,13 @@ async fn terminate_shell_session(state: &AppState, task_id: &str, name: &str, ar
     }
     let session_id =
         string_argument(arguments, "session_id").unwrap_or_else(|| "default".to_string());
-    let key = if name == "rust_sandbox_shell" {
-        format!("sandbox:{task_id}:{session_id}")
-    } else {
-        session_id
-    };
+    let workspace = workspace_root_for_arguments(arguments);
+    let key = shell_tool::session_key(
+        task_id,
+        &session_id,
+        (name == "rust_sandbox_shell").then_some("sandbox"),
+        &workspace,
+    );
     state.shell_sessions.lock().await.remove(&key);
 }
 
@@ -1963,53 +2159,93 @@ async fn perform_tool(
         .unwrap_or(&tool_call_id)
         .to_string();
 
-    let requires_approval = is_high_risk(name, arguments);
-    if requires_approval {
-        let approval = match wait_for_approval(app, state, task_id, name, arguments, cancel).await {
-            Ok(approval) => approval,
-            Err(error) => {
-                let (status, message) = match &error {
-                    AgentError::Cancelled => (
-                        ToolCallStatus::Cancelled,
-                        "Tool execution cancelled while waiting for approval.".to_string(),
-                    ),
-                    AgentError::Message(message) => (
-                        ToolCallStatus::Failed,
-                        format!("Approval failed: {message}"),
-                    ),
-                };
-                finish_tool_call(
-                    app,
-                    state,
-                    task_id,
-                    &tool_call_id,
-                    status,
-                    None,
-                    Some(message.clone()),
-                )
-                .map_err(AgentError::Message)?;
-                let _ = add_tool_message(
-                    app,
-                    state,
-                    task_id,
-                    name,
-                    &memory_tool_call_id,
-                    format!("{name} failed:\n{message}"),
+    let task = task_snapshot(state, task_id).map_err(AgentError::Message)?;
+    let task_workspace = task_workspace(&task);
+    let attachment_read_paths =
+        task_attachment_read_paths(state, &task).map_err(AgentError::Message)?;
+    let task_arguments = with_task_workspace(arguments, &task_workspace, &attachment_read_paths);
+    let (approval_mode, approval_rules) = state
+        .settings
+        .read()
+        .map(|settings| (settings.approval_mode, settings.approval_rules.clone()))
+        .map_err(|_| AgentError::Message("Settings lock is poisoned".to_string()))?;
+    // Persistent shells retain state between calls, so policy must inspect the
+    // session's actual cwd instead of trusting an optional argument from the model.
+    let policy_arguments = match name {
+        "rust_bash" | "rust_sandbox_shell" => {
+            let sandbox_prefix = (name == "rust_sandbox_shell").then_some("sandbox");
+            let cwd = shell_tool::effective_cwd(
+                state,
+                task_id,
+                &task_arguments,
+                sandbox_prefix,
+                &task_workspace,
+            )
+            .await
+            .map_err(AgentError::Message)?;
+            let mut normalized = task_arguments.clone();
+            if let Some(object) = normalized.as_object_mut() {
+                object.insert(
+                    "cwd".to_string(),
+                    Value::String(cwd.to_string_lossy().into_owned()),
                 );
-                record_memory(
-                    state,
-                    task_id,
-                    "tool",
-                    message,
-                    Some(memory_tool_call_id.clone()),
-                    vec![name.to_string()],
-                )
-                .map_err(AgentError::Message)?;
-                return Err(error);
             }
-        };
+            normalized
+        }
+        _ => task_arguments.clone(),
+    };
+    let requires_approval = needs_approval(approval_mode, &approval_rules, name, &policy_arguments);
+    let mut external_path_approved =
+        external_path_requested(name, &policy_arguments) && !requires_approval;
+    if requires_approval {
+        let approval =
+            match wait_for_approval(app, state, task_id, name, &policy_arguments, cancel).await {
+                Ok(approval) => approval,
+                Err(error) => {
+                    let (status, message) = match &error {
+                        AgentError::Cancelled => (
+                            ToolCallStatus::Cancelled,
+                            "Tool execution cancelled while waiting for approval.".to_string(),
+                        ),
+                        AgentError::Message(message) => (
+                            ToolCallStatus::Failed,
+                            format!("Approval failed: {message}"),
+                        ),
+                    };
+                    finish_tool_call(
+                        app,
+                        state,
+                        task_id,
+                        &tool_call_id,
+                        status,
+                        None,
+                        Some(message.clone()),
+                    )
+                    .map_err(AgentError::Message)?;
+                    let _ = add_tool_message(
+                        app,
+                        state,
+                        task_id,
+                        name,
+                        &memory_tool_call_id,
+                        format!("{name} failed:\n{message}"),
+                    );
+                    record_memory(
+                        state,
+                        task_id,
+                        "tool",
+                        message,
+                        Some(memory_tool_call_id.clone()),
+                        vec![name.to_string()],
+                    )
+                    .map_err(AgentError::Message)?;
+                    return Err(error);
+                }
+            };
         match approval {
-            ApprovalOutcome::Approved => {}
+            ApprovalOutcome::Approved => {
+                external_path_approved = external_path_requested(name, &policy_arguments);
+            }
             ApprovalOutcome::Rejected => {
                 let result = finish_tool_call(
                     app,
@@ -2077,10 +2313,10 @@ async fn perform_tool(
         state,
         task_id,
         name,
-        arguments,
+        &task_arguments,
         settings,
         cancel,
-        requires_approval,
+        external_path_approved,
     )
     .await;
     match execution {
@@ -2908,10 +3144,9 @@ async fn stream_openai(
     })
 }
 
-fn system_prompt_parts(agent_kind: &str) -> (String, String) {
+fn system_prompt_parts(agent_kind: &str, workspace: &str) -> (String, String) {
     let kind = agent::parse_agent_kind(agent_kind).unwrap_or(agent::AgentKind::Manus);
-    let workspace = workspace_root().display().to_string();
-    let spec = agents::AgentSpec::for_kind(kind, &workspace);
+    let spec = agents::AgentSpec::for_kind(kind, workspace);
     let policy = format!(
         "{}\n\nThe desktop runtime handles high-risk approvals. Keep every argument valid JSON, bound observations, recover from tool errors, and never claim a tool ran unless its result is present. Before each non-trivial tool call, give the user one concise factual progress sentence; after the result, state the useful implication before choosing the next action. Do not reveal chain-of-thought or invent progress that the tool result cannot support. The persisted conversation history is authoritative: treat the newest user message as a continuation of the prior exchange unless the user explicitly asks to restart, and use prior messages and tool results instead of reintroducing yourself or resetting the task. Write the final response for the user, not for the execution log: answer in the user's language, lead with the conclusion, and keep it concise. Never paste raw JSON, full directory listings, timestamps, stack traces, or tool logs unless the user explicitly asks for them. Summarize evidence and mention only the paths or values that matter. For capability questions, answer directly without calling unrelated tools. Internal planning and tool-call messages are not user-facing.",
         spec.next_step_prompt
@@ -2936,7 +3171,7 @@ async fn run_real(
         Some("The ReAct agent is deciding how to solve the request.".to_string()),
     )
     .map_err(AgentError::Message)?;
-    let (system_header, system_policy) = system_prompt_parts(&task.agent_kind);
+    let (system_header, system_policy) = system_prompt_parts(&task.agent_kind, &task.workspace);
     let system_prompt = format!("{system_header}\n\n{system_policy}");
     let system_messages = vec![
         ChatMessage {
@@ -2980,8 +3215,7 @@ async fn run_real(
     )
     .map_err(AgentError::Message)?;
     let agent_kind = agent::parse_agent_kind(&task.agent_kind).unwrap_or(agent::AgentKind::Manus);
-    let agent_spec =
-        agents::AgentSpec::for_kind(agent_kind, &workspace_root().display().to_string());
+    let agent_spec = agents::AgentSpec::for_kind(agent_kind, &task.workspace);
     let max_steps = normalize_max_steps(settings.max_steps);
     let mut runtime = agent::ToolCallAgentRuntime::new(task.agent_name.clone(), system_prompt);
     runtime.base.description = agent_spec.description;
@@ -3476,6 +3710,8 @@ fn settings_view(settings: &AgentSettings, state: Option<&AppState>) -> Settings
         max_steps: settings.max_steps,
         timeout_secs: settings.timeout_secs,
         prompt_cache: settings.prompt_cache,
+        approval_mode: settings.approval_mode,
+        remembered_approvals: settings.approval_rules.len(),
         demo_mode: settings.api_key.is_none(),
         available_tools: available_tool_views(state),
     }
@@ -3485,6 +3721,7 @@ fn task_summary(task: &Task) -> TaskSummary {
     TaskSummary {
         id: task.id.clone(),
         title: task.title.clone(),
+        workspace: task.workspace.clone(),
         status: task.status.clone(),
         updated_at: task.updated_at,
         demo_mode: task.demo_mode,
@@ -3507,6 +3744,89 @@ fn task_summaries(state: &AppState, archived: bool) -> Result<Vec<TaskSummary>, 
     Ok(summaries)
 }
 
+fn project_task_counts(state: &AppState) -> HashMap<String, usize> {
+    state
+        .tasks
+        .read()
+        .map(|tasks| {
+            let mut counts = HashMap::with_capacity(tasks.len());
+            for task in tasks.values() {
+                *counts
+                    .entry(project_store::path_key(Path::new(&task.workspace)))
+                    .or_insert(0) += 1;
+            }
+            counts
+        })
+        .unwrap_or_default()
+}
+
+fn project_summary(
+    record: &project_store::ProjectRecord,
+    task_counts: &HashMap<String, usize>,
+) -> ProjectSummary {
+    let directory = PathBuf::from(&record.directory);
+    let key = project_store::path_key(&directory);
+    ProjectSummary {
+        task_count: task_counts.get(&key).copied().unwrap_or_default(),
+        id: key,
+        directory: record.directory.clone(),
+        name: project_store::display_name(&directory),
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
+}
+
+fn project_summaries(
+    state: &AppState,
+    recently_closed: bool,
+) -> Result<Vec<ProjectSummary>, String> {
+    let projects = state
+        .projects
+        .read()
+        .map_err(|_| "Project lock is poisoned".to_string())?;
+    let records = if recently_closed {
+        projects.recently_closed.clone()
+    } else {
+        projects.open.clone()
+    };
+    drop(projects);
+    let task_counts = project_task_counts(state);
+    Ok(records
+        .iter()
+        .map(|record| project_summary(record, &task_counts))
+        .collect())
+}
+
+fn open_project_internal(state: &AppState, raw_path: &str) -> Result<ProjectSummary, String> {
+    let directory = project_store::normalize_directory(raw_path)?;
+    let timestamp = now();
+    let changed = {
+        let mut projects = state
+            .projects
+            .write()
+            .map_err(|_| "Project lock is poisoned".to_string())?;
+        projects.open(&directory, timestamp)
+    };
+    if changed {
+        state.persist_projects()?;
+    }
+    let record = state
+        .projects
+        .read()
+        .map_err(|_| "Project lock is poisoned".to_string())?;
+    let record = record
+        .open
+        .iter()
+        .find(|record| {
+            project_store::path_key(Path::new(&record.directory))
+                == project_store::path_key(&directory)
+        })
+        .cloned()
+        .ok_or_else(|| "Project was not recorded after opening.".to_string())?;
+    let task_counts = project_task_counts(state);
+    Ok(project_summary(&record, &task_counts))
+}
+
 #[tauri::command(rename_all = "camelCase")]
 async fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskSummary>, String> {
     task_summaries(&state, false)
@@ -3515,6 +3835,64 @@ async fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskSummary>, Stri
 #[tauri::command(rename_all = "camelCase")]
 async fn list_archived_tasks(state: State<'_, AppState>) -> Result<Vec<TaskSummary>, String> {
     task_summaries(&state, true)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectSummary>, String> {
+    project_summaries(&state, false)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn list_recent_projects(state: State<'_, AppState>) -> Result<Vec<ProjectSummary>, String> {
+    project_summaries(&state, true)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn open_project(state: State<'_, AppState>, path: String) -> Result<ProjectSummary, String> {
+    open_project_internal(&state, &path)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn pick_project(
+    state: State<'_, AppState>,
+    kind: String,
+) -> Result<Option<ProjectSummary>, String> {
+    let Some(path) = project_store::pick_path(&kind)? else {
+        return Ok(None);
+    };
+    open_project_internal(&state, &path.to_string_lossy()).map(Some)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn close_project(state: State<'_, AppState>, directory: String) -> Result<bool, String> {
+    let directory = project_store::normalize_directory(&directory)?;
+    let changed = {
+        let mut projects = state
+            .projects
+            .write()
+            .map_err(|_| "Project lock is poisoned".to_string())?;
+        projects.close(&directory, now())
+    };
+    if changed {
+        state.persist_projects()?;
+    }
+    Ok(changed)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn touch_project(state: State<'_, AppState>, directory: String) -> Result<bool, String> {
+    let directory = project_store::normalize_directory(&directory)?;
+    let changed = {
+        let mut projects = state
+            .projects
+            .write()
+            .map_err(|_| "Project lock is poisoned".to_string())?;
+        projects.touch(&directory, now())
+    };
+    if changed {
+        state.persist_projects()?;
+    }
+    Ok(changed)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -3636,6 +4014,7 @@ fn create_task_internal(
     prompt: String,
     attachment_inputs: Vec<attachments::AttachmentInput>,
     attachment_paths: Vec<attachments::AttachmentPathInput>,
+    workspace_raw: Option<String>,
 ) -> Result<Task, String> {
     let prompt = prompt.trim().to_string();
     if prompt.is_empty() && attachment_inputs.is_empty() && attachment_paths.is_empty() {
@@ -3644,6 +4023,12 @@ fn create_task_internal(
     if !api_key_configured(state)? {
         return Err(API_KEY_REQUIRED_MESSAGE.to_string());
     }
+    let fallback_workspace = workspace_root();
+    let workspace = match workspace_raw.as_deref() {
+        Some(raw) => project_store::normalize_directory(raw)?,
+        None => project_store::normalize_directory(&fallback_workspace.to_string_lossy())?,
+    };
+    open_project_internal(state, &workspace.to_string_lossy())?;
     let demo_mode = false;
     let task_id = new_id("task");
     let attachment_refs =
@@ -3653,6 +4038,7 @@ fn create_task_internal(
         id: task_id.clone(),
         title: task_title(&prompt, attachment_refs.len()),
         prompt: prompt.clone(),
+        workspace: project_store::display_directory(&workspace),
         status: AgentStatus::Idle,
         created_at,
         updated_at: created_at,
@@ -3760,6 +4146,7 @@ async fn create_task(
     prompt: String,
     attachment_inputs: Option<Vec<attachments::AttachmentInput>>,
     attachment_paths: Option<Vec<attachments::AttachmentPathInput>>,
+    workspace: Option<String>,
 ) -> Result<Task, String> {
     create_task_internal(
         &app,
@@ -3767,6 +4154,7 @@ async fn create_task(
         prompt,
         attachment_inputs.unwrap_or_default(),
         attachment_paths.unwrap_or_default(),
+        workspace,
     )
 }
 
@@ -4143,6 +4531,12 @@ async fn update_settings(
     if let Some(prompt_cache) = input.prompt_cache {
         settings.prompt_cache = prompt_cache;
     }
+    if let Some(approval_mode) = input.approval_mode {
+        settings.approval_mode = approval_mode;
+    }
+    if input.clear_approval_rules {
+        settings.approval_rules.clear();
+    }
     let view = settings_view(&settings, Some(&state));
     drop(settings);
     state.persist_settings()?;
@@ -4156,13 +4550,33 @@ async fn respond_to_approval(
     task_id: String,
     approval_id: String,
     approved: bool,
+    remember: Option<bool>,
 ) -> Result<bool, String> {
-    let sender = state
-        .approval_waiters
-        .write()
-        .map_err(|_| "Approval lock is poisoned".to_string())?
-        .remove(&approval_id);
-    if let Some(sender) = sender {
+    let waiter = {
+        let mut waiters = state
+            .approval_waiters
+            .write()
+            .map_err(|_| "Approval lock is poisoned".to_string())?;
+        if waiters
+            .get(&approval_id)
+            .is_some_and(|waiter| waiter.task_id == task_id)
+        {
+            waiters.remove(&approval_id)
+        } else {
+            None
+        }
+    };
+    if let Some(waiter) = waiter {
+        if approved && remember.unwrap_or(false) {
+            if let Err(error) = remember_approval_rule(&state, &task_id, &approval_id) {
+                warn!(
+                    task_id = %task_id,
+                    approval_id = %approval_id,
+                    error = %error,
+                    "Approval decision delivered but remembered rule was not persisted"
+                );
+            }
+        }
         update_approval_status(
             &app,
             &state,
@@ -4170,11 +4584,58 @@ async fn respond_to_approval(
             &approval_id,
             if approved { "approved" } else { "rejected" },
         );
-        let _ = sender.send(approved);
+        let _ = waiter.sender.send(approved);
         Ok(true)
     } else {
         Ok(false)
     }
+}
+
+fn remember_approval_rule(
+    state: &AppState,
+    task_id: &str,
+    approval_id: &str,
+) -> Result<(), String> {
+    let request = state
+        .tasks
+        .read()
+        .map_err(|_| "Task lock is poisoned".to_string())?
+        .get(task_id)
+        .and_then(|task| {
+            task.approval_requests
+                .iter()
+                .find(|request| request.id == approval_id)
+                .cloned()
+        });
+    let Some(request) = request else {
+        return Ok(());
+    };
+    let (Some(action), Some(resource)) = (request.remember_action, request.remember_pattern) else {
+        return Ok(());
+    };
+    let mut settings = state
+        .settings
+        .write()
+        .map_err(|_| "Settings lock is poisoned".to_string())?;
+    settings.approval_rules = sanitize_rules(
+        settings
+            .approval_rules
+            .iter()
+            .cloned()
+            .chain(std::iter::once(ApprovalRule {
+                workspace: state
+                    .tasks
+                    .read()
+                    .ok()
+                    .and_then(|tasks| tasks.get(task_id).map(|task| task.workspace.clone()))
+                    .unwrap_or_else(tool_policy::workspace_key),
+                action,
+                resource,
+            }))
+            .collect(),
+    );
+    drop(settings);
+    state.persist_settings()
 }
 
 fn spawn_a2a_server(app: &AppHandle, state: &AppState) {
@@ -4189,7 +4650,8 @@ fn spawn_a2a_server(app: &AppHandle, state: &AppState) {
         let app = app_handle.clone();
         let state = app_state.clone();
         Box::pin(async move {
-            let task = match create_task_internal(&app, &state, query, Vec::new(), Vec::new()) {
+            let task = match create_task_internal(&app, &state, query, Vec::new(), Vec::new(), None)
+            {
                 Ok(task) => task,
                 Err(error) => return protocol::A2AResponse::error(error),
             };
@@ -4250,6 +4712,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_tasks,
             list_archived_tasks,
+            list_projects,
+            list_recent_projects,
+            open_project,
+            pick_project,
+            close_project,
+            touch_project,
             get_task,
             get_task_events,
             get_attachment_preview,

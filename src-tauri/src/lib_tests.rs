@@ -32,12 +32,40 @@ fn legacy_task_summaries_default_to_unarchived() {
     assert!(!summary.archived);
 }
 
+#[test]
+fn legacy_settings_and_approval_records_accept_missing_authorization_fields() {
+    let settings: PersistedSettings = serde_json::from_value(json!({
+        "api_base_url": "https://api.example.test/v1",
+        "model": "legacy-model",
+        "max_steps": 12,
+        "timeout_secs": 30
+    }))
+    .expect("legacy settings should remain readable");
+    assert!(settings.approval_mode.is_none());
+    assert!(settings.approval_rules.is_empty());
+
+    let request: ApprovalRequest = serde_json::from_value(json!({
+        "id": "approval-1",
+        "task_id": "task-1",
+        "tool_name": "rust_shell",
+        "reason": "legacy reason",
+        "details": "{}",
+        "created_at": 1,
+        "status": "pending"
+    }))
+    .expect("legacy approval request should remain readable");
+    assert!(!request.rememberable);
+    assert!(request.remember_action.is_none());
+    assert!(request.remember_pattern.is_none());
+}
+
 fn test_task(task_id: &str) -> Task {
     let message_id = format!("{task_id}-message");
     Task {
         id: task_id.to_string(),
         title: "Test task".to_string(),
         prompt: "test prompt".to_string(),
+        workspace: std::env::current_dir().unwrap().display().to_string(),
         status: AgentStatus::Idle,
         created_at: 1,
         updated_at: 1,
@@ -485,8 +513,9 @@ fn identical_mcp_refresh_does_not_invalidate_tool_snapshot() {
 
 #[test]
 fn system_prompt_is_split_into_stable_cacheable_parts() {
-    let first = system_prompt_parts("manus");
-    let second = system_prompt_parts("manus");
+    let workspace = workspace_root();
+    let first = system_prompt_parts("manus", &workspace.to_string_lossy());
+    let second = system_prompt_parts("manus", &workspace.to_string_lossy());
     assert_eq!(first, second);
     assert!(!first.0.is_empty());
     assert!(!first.1.is_empty());
@@ -910,13 +939,18 @@ fn context_budget_keeps_assistant_and_tool_messages_together() {
 
 #[tokio::test]
 async fn visualization_tool_writes_a_real_html_artifact() {
-    let source = std::env::temp_dir().join(format!("rustpilot-data-{}.csv", Uuid::new_v4()));
+    let workspace = std::env::temp_dir().join(format!("rustpilot-data-{}", Uuid::new_v4()));
+    fs::create_dir_all(&workspace).expect("temporary workspace should be created");
+    let source = workspace.join("source.csv");
     fs::write(&source, "label,value\nA,2\nB,5\n").expect("source should be written");
-    let output = data_tool::run_data_visualization_tool(&json!({
-        "path": source,
-        "output_type": "html",
-        "title": "Test chart"
-    }))
+    let output = data_tool::run_data_visualization_tool(
+        &json!({
+            "path": "source.csv",
+            "output_type": "html",
+            "title": "Test chart"
+        }),
+        &workspace,
+    )
     .await
     .expect("visualization should succeed");
     let value: Value = serde_json::from_str(&output).expect("visualization output should be JSON");
@@ -926,6 +960,5 @@ async fn visualization_tool_writes_a_real_html_artifact() {
     assert!(Path::new(chart_path).exists());
     let html = fs::read_to_string(chart_path).expect("chart HTML should be readable");
     assert!(html.contains("<svg"));
-    let _ = fs::remove_file(chart_path);
-    let _ = fs::remove_file(source);
+    let _ = fs::remove_dir_all(workspace);
 }

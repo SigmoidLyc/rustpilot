@@ -3,7 +3,10 @@ use tokio::process::Command;
 
 use crate::{base64_encode, sandbox_path_for_task, string_argument, truncate_output};
 
-pub(crate) async fn run_python(arguments: &Value) -> Result<String, String> {
+pub(crate) async fn run_python(
+    arguments: &Value,
+    workspace: &std::path::Path,
+) -> Result<String, String> {
     let code = string_argument(arguments, "code")
         .ok_or_else(|| "rust_python_execute requires code".to_string())?;
     #[cfg(target_os = "windows")]
@@ -12,6 +15,7 @@ pub(crate) async fn run_python(arguments: &Value) -> Result<String, String> {
     let mut process = Command::new("python3");
     let output = process
         .args(["-c", &code])
+        .current_dir(workspace)
         .kill_on_drop(true)
         .output()
         .await
@@ -29,10 +33,14 @@ pub(crate) async fn run_python(arguments: &Value) -> Result<String, String> {
     ))
 }
 
-pub(crate) async fn run_sandbox_vision(task_id: &str, arguments: &Value) -> Result<String, String> {
+pub(crate) async fn run_sandbox_vision(
+    task_id: &str,
+    arguments: &Value,
+    workspace: &std::path::Path,
+) -> Result<String, String> {
     let raw_path = string_argument(arguments, "path")
         .ok_or_else(|| "rust_sandbox_vision requires path".to_string())?;
-    let path = sandbox_path_for_task(task_id, &raw_path)?;
+    let path = sandbox_path_for_task(task_id, &raw_path, workspace)?;
     let metadata = tokio::fs::metadata(&path)
         .await
         .map_err(|error| format!("Unable to inspect {}: {error}", path.display()))?;

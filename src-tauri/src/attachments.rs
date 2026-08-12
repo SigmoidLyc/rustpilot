@@ -270,6 +270,10 @@ pub fn read(data_dir: &Path, attachment: &AttachmentRef) -> Result<Vec<u8>, Stri
         .map_err(|error| format!("Unable to read attachment {}: {error}", attachment.name))
 }
 
+pub(crate) fn read_path(data_dir: &Path, attachment: &AttachmentRef) -> Result<PathBuf, String> {
+    storage_path(data_dir, &attachment.storage_key)
+}
+
 pub fn remove_task(data_dir: &Path, task_id: &str) -> Result<(), String> {
     validate_task_id(task_id)?;
     let directory = data_dir.join(ATTACHMENTS_DIRECTORY).join(task_id);

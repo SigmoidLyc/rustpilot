@@ -15,6 +15,7 @@
   let maxSteps = 100;
   let timeoutSecs = 45;
   let promptCache: PromptCacheMode = "auto";
+  let clearApprovalRules = false;
 
   $: if (settings) {
     apiBaseUrl = settings.api_base_url;
@@ -22,6 +23,7 @@
     maxSteps = settings.max_steps;
     timeoutSecs = settings.timeout_secs;
     promptCache = settings.prompt_cache;
+    clearApprovalRules = false;
     clearStoredKey = false;
   }
 
@@ -32,7 +34,9 @@
       api_key: clearStoredKey ? "" : apiKey.trim() ? apiKey.trim() : null,
       max_steps: Number(maxSteps),
       timeout_secs: Number(timeoutSecs),
-      prompt_cache: promptCache
+      prompt_cache: promptCache,
+      approval_mode: settings.approval_mode,
+      clear_approval_rules: clearApprovalRules
     });
   }
 </script>
@@ -93,6 +97,13 @@
             <option value="disabled">Disabled</option>
           </select>
         </label>
+
+        {#if settings.remembered_approvals > 0}
+          <label class="settings-checkline">
+            <input bind:checked={clearApprovalRules} type="checkbox" />
+            <span>Clear {settings.remembered_approvals} remembered approval rule{settings.remembered_approvals === 1 ? "" : "s"}</span>
+          </label>
+        {/if}
 
         <div class="settings-mode">
           <span class:mode-live={!settings.demo_mode} class="mode-indicator"></span>

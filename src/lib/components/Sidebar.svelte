@@ -3,21 +3,36 @@
     Archive,
     ChevronDown,
     ChevronRight,
+    FolderOpen,
     FilePlus2,
     Folder,
     ListTodo,
     MoreHorizontal,
+    PanelLeftClose,
     RotateCcw,
     Settings2,
     Trash2
   } from "lucide-svelte";
-  import type { TaskSummary } from "../types";
+  import { onMount } from "svelte";
+  import type { PhysicalPosition } from "@tauri-apps/api/dpi";
+  import { getCurrentWebview } from "@tauri-apps/api/webview";
+  import { isTauriRuntime } from "../api";
+  import type { ProjectSummary, TaskSummary } from "../types";
 
   export let tasks: TaskSummary[] = [];
   export let archivedTasks: TaskSummary[] = [];
+  export let projects: ProjectSummary[] = [];
+  export let recentlyClosedProjects: ProjectSummary[] = [];
+  export let selectedWorkspace = "";
   export let selectedTaskId = "";
   export let onNewTask: () => void;
+  export let onNewTaskInProject: (directory: string) => void;
   export let onSelectTask: (taskId: string) => void;
+  export let onSelectProject: (directory: string) => void;
+  export let onOpenProject: (path: string) => void;
+  export let onPickProject: (kind: "file" | "folder") => void;
+  export let onCloseProject: (directory: string) => void;
+  export let onReopenProject: (directory: string) => void;
   export let onArchiveTask: (taskId: string) => void;
   export let onRestoreTask: (taskId: string) => void;
   export let onDeleteTask: (taskId: string) => void;
@@ -25,6 +40,12 @@
 
   let openMenuId = "";
   let archivedExpanded = false;
+  let closedExpanded = false;
+  let projectDragging = false;
+  let sidebarElement: HTMLElement;
+  let tasksByWorkspace = new Map<string, TaskSummary[]>();
+
+  $: tasksByWorkspace = groupTasksByWorkspace(tasks);
 
   function formatDate(timestamp: number): string {
     const date = new Date(timestamp);
@@ -66,11 +87,95 @@
       onDeleteTask(task.id);
     }
   }
+
+  function groupTasksByWorkspace(items: TaskSummary[]): Map<string, TaskSummary[]> {
+    const grouped = new Map<string, TaskSummary[]>();
+    for (const task of items) {
+      const group = grouped.get(task.workspace);
+      if (group) group.push(task);
+      else grouped.set(task.workspace, [task]);
+    }
+    return grouped;
+  }
+
+  function projectLabel(directory: string): string {
+    return directory.replace(/\\/g, "/").split("/").filter(Boolean).at(-1) ?? directory;
+  }
+
+  function nativeDropIsInside(position: PhysicalPosition): boolean {
+    if (!sidebarElement) return false;
+    const logical = position.toLogical(window.devicePixelRatio || 1);
+    const bounds = sidebarElement.getBoundingClientRect();
+    return (
+      logical.x >= bounds.left &&
+      logical.x <= bounds.right &&
+      logical.y >= bounds.top &&
+      logical.y <= bounds.bottom
+    );
+  }
+
+  function handleNativeDrop(paths: string[]): void {
+    projectDragging = false;
+    const path = paths[0]?.trim();
+    if (path) onOpenProject(path);
+  }
+
+  function handleDragOver(event: DragEvent): void {
+    if (!event.dataTransfer?.types.includes("Files")) return;
+    event.preventDefault();
+    projectDragging = true;
+  }
+
+  function handleDragLeave(event: DragEvent): void {
+    if (event.currentTarget === event.target) projectDragging = false;
+  }
+
+  function handleDrop(event: DragEvent): void {
+    event.preventDefault();
+    projectDragging = false;
+    if (isTauriRuntime) return;
+    const path = Array.from(event.dataTransfer?.files ?? [])[0]?.name;
+    if (path) onOpenProject(path);
+  }
+
+  onMount(() => {
+    if (!isTauriRuntime) return;
+    let disposed = false;
+    let remove: (() => void) | undefined;
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === "enter" || event.payload.type === "over") {
+          projectDragging = nativeDropIsInside(event.payload.position);
+        } else if (event.payload.type === "leave") {
+          projectDragging = false;
+        } else if (event.payload.type === "drop") {
+          const acceptingDrop = nativeDropIsInside(event.payload.position);
+          projectDragging = false;
+          if (acceptingDrop) handleNativeDrop(event.payload.paths);
+        }
+      })
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else remove = unlisten;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      remove?.();
+    };
+  });
 </script>
 
 <svelte:window on:click={closeMenu} />
 
-<aside class="sidebar">
+<aside
+  bind:this={sidebarElement}
+  class="sidebar"
+  class:sidebar-dragging={projectDragging}
+  on:dragover={handleDragOver}
+  on:dragleave={handleDragLeave}
+  on:drop={handleDrop}
+>
   <div class="sidebar-heading">
     <div class="section-label"><ListTodo size={15} strokeWidth={2} /> Projects</div>
     <button
@@ -91,28 +196,39 @@
   </button>
 
   <div class="sidebar-list" aria-label="Projects">
-    {#if tasks.length === 0}
+    <div class="project-actions">
+      <button type="button" class="project-action" on:click={() => onPickProject("folder")}>
+        <FolderOpen size={14} />
+        <span>Open folder</span>
+      </button>
+      <button type="button" class="project-action" on:click={() => onPickProject("file")}>
+        <FilePlus2 size={14} />
+        <span>Open file</span>
+      </button>
+    </div>
+
+    {#if projects.length === 0}
       <div class="sidebar-empty">
-        <span class="sidebar-empty-title">No projects yet</span>
-        <span>Start with a new task.</span>
+        <span class="sidebar-empty-title">No projects open</span>
+        <span>Open a folder or file to begin.</span>
       </div>
     {:else}
-      <div class="sidebar-group-label">Recent</div>
-      {#each tasks as task (task.id)}
-        <div class:active={task.id === selectedTaskId} class="task-row-wrap">
+      <div class="sidebar-group-label">Open</div>
+      {#each projects as project (project.id)}
+        {@const projectTaskList = tasksByWorkspace.get(project.directory) ?? []}
+        <div class:selected={project.directory === selectedWorkspace} class="project-block">
           <button
-            class="task-row"
+            class="project-row"
             type="button"
-            aria-current={task.id === selectedTaskId ? "page" : undefined}
-            on:click={() => onSelectTask(task.id)}
+            aria-current={project.directory === selectedWorkspace ? "page" : undefined}
+            on:click={() => onSelectProject(project.directory)}
           >
-            <Folder class="task-row-icon" size={16} strokeWidth={1.8} />
-            <span class="task-row-main">
-              <span class="task-title">{task.title}</span>
+            <Folder class="project-row-icon" size={16} strokeWidth={1.8} />
+            <span class="project-row-main">
+              <span class="project-name" title={project.directory}>{project.name || projectLabel(project.directory)}</span>
               <span class="task-meta">
-                <span class={`task-status-dot status-${task.status}`} aria-hidden="true"></span>
-                <span>{statusLabel(task.status)}</span>
-                <span class="task-date">{formatDate(task.updated_at)}</span>
+                <span>{projectTaskList.length} task{projectTaskList.length === 1 ? "" : "s"}</span>
+                <span class="task-date" title={project.directory}>{project.directory}</span>
               </span>
             </span>
           </button>
@@ -120,26 +236,64 @@
             class="task-row-menu icon-button compact"
             type="button"
             title="Project actions"
-            aria-label={`Actions for ${task.title}`}
-            aria-expanded={openMenuId === task.id}
-            on:click|stopPropagation={() => (openMenuId = openMenuId === task.id ? "" : task.id)}
+            aria-label={`Actions for ${project.name}`}
+            aria-expanded={openMenuId === project.id}
+            on:click|stopPropagation={() => (openMenuId = openMenuId === project.id ? "" : project.id)}
           >
             <MoreHorizontal size={16} />
           </button>
-          {#if openMenuId === task.id}
+          {#if openMenuId === project.id}
             <div class="task-menu" role="menu" tabindex="-1">
-              <button type="button" role="menuitem" on:click={() => { closeMenu(); onArchiveTask(task.id); }}>
-                <Archive size={15} />
-                <span>Archive</span>
+              <button type="button" role="menuitem" on:click={() => { closeMenu(); onNewTaskInProject(project.directory); }}>
+                <FilePlus2 size={15} />
+                <span>New task here</span>
               </button>
-              <button class="danger" type="button" role="menuitem" on:click={() => askDelete(task)}>
-                <Trash2 size={15} />
-                <span>Delete</span>
+              <button type="button" role="menuitem" on:click={() => { closeMenu(); onCloseProject(project.directory); }}>
+                <PanelLeftClose size={15} />
+                <span>Close project</span>
               </button>
             </div>
           {/if}
         </div>
+        {#if project.directory === selectedWorkspace && projectTaskList.length > 0}
+          <div class="project-tasks">
+            {#each projectTaskList as task (task.id)}
+              <div class:active={task.id === selectedTaskId} class="task-row-wrap">
+                <button class="task-row" type="button" on:click={() => onSelectTask(task.id)}>
+                  <span class={`task-status-dot status-${task.status}`} aria-hidden="true"></span>
+                  <span class="task-row-main">
+                    <span class="task-title">{task.title}</span>
+                    <span class="task-meta"><span>{statusLabel(task.status)}</span><span class="task-date">{formatDate(task.updated_at)}</span></span>
+                  </span>
+                </button>
+                <button class="task-row-menu icon-button compact" type="button" title="Task actions" aria-label={`Actions for ${task.title}`} aria-expanded={openMenuId === task.id} on:click|stopPropagation={() => (openMenuId = openMenuId === task.id ? "" : task.id)}><MoreHorizontal size={16} /></button>
+                {#if openMenuId === task.id}
+                  <div class="task-menu" role="menu" tabindex="-1">
+                    <button type="button" role="menuitem" on:click={() => { closeMenu(); onArchiveTask(task.id); }}><Archive size={15} /><span>Archive</span></button>
+                    <button class="danger" type="button" role="menuitem" on:click={() => askDelete(task)}><Trash2 size={15} /><span>Delete</span></button>
+                  </div>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
       {/each}
+    {/if}
+
+    {#if recentlyClosedProjects.length > 0}
+      <button class="archived-toggle" type="button" aria-expanded={closedExpanded} on:click={() => (closedExpanded = !closedExpanded)}>
+        {#if closedExpanded}<ChevronDown size={14} />{:else}<ChevronRight size={14} />{/if}
+        <RotateCcw size={15} /><span>Recently closed</span><span class="count-badge">{recentlyClosedProjects.length}</span>
+      </button>
+      {#if closedExpanded}
+        <div class="archived-list" aria-label="Recently closed projects">
+          {#each recentlyClosedProjects as project (project.id)}
+            <button class="closed-project-row" type="button" on:click={() => onReopenProject(project.directory)}>
+              <Folder size={15} /><span title={project.directory}>{project.name}</span>
+            </button>
+          {/each}
+        </div>
+      {/if}
     {/if}
 
     {#if archivedTasks.length > 0}

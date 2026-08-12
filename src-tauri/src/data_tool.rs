@@ -1,10 +1,14 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::{
-    ensure_writable_directory, path_guard, string_argument, truncate_output, workspace_root,
+    ensure_writable_directory, path_guard, string_argument, truncate_output,
+    INTERNAL_ATTACHMENT_READ_PATHS_ARGUMENT,
 };
 
 pub(crate) fn parse_csv_line(line: &str) -> Vec<String> {
@@ -110,11 +114,46 @@ pub(crate) async fn load_table(path: &str) -> Result<(Vec<String>, Vec<Vec<Strin
     table_from_contents(path, &contents)
 }
 
-pub(crate) async fn run_data_analysis_tool(arguments: &Value) -> Result<String, String> {
+fn resolve_workspace_input(
+    raw: &str,
+    workspace: &Path,
+    arguments: &Value,
+) -> Result<PathBuf, String> {
+    if let Ok(path) = path_guard::resolve_scoped_path(workspace, raw) {
+        return Ok(path);
+    }
+
+    let requested = PathBuf::from(raw);
+    if !requested.is_absolute() {
+        return Err(format!("Data input is outside the active workspace: {raw}"));
+    }
+    let requested = requested
+        .canonicalize()
+        .map_err(|error| format!("Unable to resolve data input {raw}: {error}"))?;
+    let allowed = arguments
+        .get(INTERNAL_ATTACHMENT_READ_PATHS_ARGUMENT)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|path| PathBuf::from(path).canonicalize().ok())
+        .any(|path| path == requested);
+    if allowed {
+        Ok(requested)
+    } else {
+        Err(format!("Data input is outside the active workspace: {raw}"))
+    }
+}
+
+pub(crate) async fn run_data_analysis_tool(
+    arguments: &Value,
+    workspace: &std::path::Path,
+) -> Result<String, String> {
     let path = string_argument(arguments, "path")
         .or_else(|| string_argument(arguments, "json_path"))
         .ok_or_else(|| "rust_data_analysis requires path".to_string())?;
-    let (headers, rows) = load_table(&path).await?;
+    let path = resolve_workspace_input(&path, workspace, arguments)?;
+    let (headers, rows) = load_table(&path.to_string_lossy()).await?;
     let mut missing = vec![0usize; headers.len()];
     let mut numeric_sum = vec![0.0f64; headers.len()];
     let mut numeric_count = vec![0usize; headers.len()];
@@ -332,6 +371,7 @@ pub(crate) fn write_png_chart(path: &Path, values: &[f64]) -> Result<(), String>
 pub(crate) fn run_visualization_preparation(
     arguments: &Value,
     external_path_approved: bool,
+    workspace: &std::path::Path,
 ) -> Result<String, String> {
     let kind = string_argument(arguments, "kind").unwrap_or_else(|| "bar".to_string());
     let title =
@@ -352,8 +392,7 @@ pub(crate) fn run_visualization_preparation(
     });
     if let Some(path) = string_argument(arguments, "output_path") {
         let path =
-            path_guard::resolve_mutation_path(&workspace_root(), &path, external_path_approved)?
-                .canonical;
+            path_guard::resolve_mutation_path(workspace, &path, external_path_approved)?.canonical;
         fs::write(
             &path,
             serde_json::to_vec_pretty(&specification).unwrap_or_default(),
@@ -367,7 +406,10 @@ pub(crate) fn run_visualization_preparation(
     .unwrap_or_default())
 }
 
-pub(crate) async fn run_data_visualization_tool(arguments: &Value) -> Result<String, String> {
+pub(crate) async fn run_data_visualization_tool(
+    arguments: &Value,
+    workspace: &std::path::Path,
+) -> Result<String, String> {
     let input_path = string_argument(arguments, "path")
         .or_else(|| string_argument(arguments, "json_path"))
         .ok_or_else(|| "rust_data_visualization requires path or json_path".to_string())?;
@@ -379,7 +421,8 @@ pub(crate) async fn run_data_visualization_tool(arguments: &Value) -> Result<Str
         .to_lowercase();
     let mut sources = Vec::new();
     let descriptor = if input_path.to_lowercase().ends_with(".json") {
-        tokio::fs::read_to_string(&input_path)
+        let descriptor_path = resolve_workspace_input(&input_path, workspace, arguments)?;
+        tokio::fs::read_to_string(descriptor_path)
             .await
             .ok()
             .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
@@ -413,17 +456,12 @@ pub(crate) async fn run_data_visualization_tool(arguments: &Value) -> Result<Str
                 .unwrap_or_else(|| "RustPilot data report".to_string()),
         ));
     }
-    let workspace = workspace_root();
-    let output_dir = path_guard::resolve_scoped_path(&workspace, ".rustpilot/visualization")?;
+    let output_dir = path_guard::resolve_scoped_path(workspace, ".rustpilot/visualization")?;
     let output_dir = io_compatible_path(ensure_writable_directory(output_dir, "visualization")?);
     let mut results = Vec::new();
     for (source_path, title) in sources.into_iter().take(16) {
-        let source_path = if Path::new(&source_path).is_absolute() {
-            source_path
-        } else {
-            workspace_root().join(source_path).display().to_string()
-        };
-        let (headers, rows) = load_table(&source_path).await?;
+        let source_path = resolve_workspace_input(&source_path, workspace, arguments)?;
+        let (headers, rows) = load_table(&source_path.to_string_lossy()).await?;
         let (labels, values) = chart_values(&headers, &rows);
         let slug = title
             .chars()
@@ -458,8 +496,12 @@ pub(crate) async fn run_data_visualization_tool(arguments: &Value) -> Result<Str
                 })
                 .collect::<String>();
             let html = format!("<!doctype html><meta charset=\"utf-8\"><title>{}</title><style>body{{font-family:system-ui,sans-serif;background:#fbfaf7;color:#262522;margin:32px}}table{{border-collapse:collapse;margin-top:24px}}td,th{{border:1px solid #d5d1c8;padding:6px 9px;text-align:left}}</style><h1>{}</h1>{}<table><thead><tr>{}</tr></thead><tbody>{}</tbody></table>", escape_html(&title), escape_html(&title), svg, headers.iter().map(|header| format!("<th>{}</th>", escape_html(header))).collect::<String>(), rows_html);
-            fs::write(&chart_path, html)
-                .map_err(|error| format!("Unable to write chart HTML {}: {error}", chart_path.display()))?;
+            fs::write(&chart_path, html).map_err(|error| {
+                format!(
+                    "Unable to write chart HTML {}: {error}",
+                    chart_path.display()
+                )
+            })?;
         }
         let insight_path = if tool_type == "insight" {
             let path = output_dir.join(format!("{stem}.md"));
@@ -483,7 +525,9 @@ pub(crate) async fn run_data_visualization_tool(arguments: &Value) -> Result<Str
                     average
                 ),
             )
-            .map_err(|error| format!("Unable to write chart insights {}: {error}", path.display()))?;
+            .map_err(|error| {
+                format!("Unable to write chart insights {}: {error}", path.display())
+            })?;
             Some(path.display().to_string())
         } else {
             None

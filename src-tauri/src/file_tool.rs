@@ -2,17 +2,19 @@ use serde_json::Value;
 
 use crate::{
     coding::MAX_EDIT_BYTES, path_guard, sandbox_path_for_task, string_argument, truncate_output,
-    workspace_root,
 };
 
-pub(crate) async fn run(arguments: &Value, external_path_approved: bool) -> Result<String, String> {
+pub(crate) async fn run(
+    arguments: &Value,
+    external_path_approved: bool,
+    workspace: &std::path::Path,
+) -> Result<String, String> {
     let operation = string_argument(arguments, "operation").unwrap_or_else(|| "list".to_string());
     let raw_path = string_argument(arguments, "path").unwrap_or_else(|| ".".to_string());
     let path = if matches!(operation.as_str(), "write" | "delete") {
-        path_guard::resolve_mutation_path(&workspace_root(), &raw_path, external_path_approved)?
-            .canonical
+        path_guard::resolve_mutation_path(workspace, &raw_path, external_path_approved)?.canonical
     } else {
-        path_guard::resolve_scoped_path(&workspace_root(), &raw_path)?
+        path_guard::resolve_scoped_path(workspace, &raw_path)?
     };
     match operation.as_str() {
         "list" => {
@@ -81,10 +83,11 @@ pub(crate) async fn run_sandbox(
     task_id: &str,
     arguments: &Value,
     external_path_approved: bool,
+    workspace: &std::path::Path,
 ) -> Result<String, String> {
     let raw_path = string_argument(arguments, "path").unwrap_or_else(|| ".".to_string());
-    let path = sandbox_path_for_task(task_id, &raw_path)?;
+    let path = sandbox_path_for_task(task_id, &raw_path, workspace)?;
     let mut forwarded = arguments.clone();
     forwarded["path"] = Value::String(path.to_string_lossy().to_string());
-    run(&forwarded, external_path_approved).await
+    run(&forwarded, external_path_approved, workspace).await
 }

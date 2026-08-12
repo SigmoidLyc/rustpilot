@@ -2,7 +2,7 @@ use std::{collections::VecDeque, fs, path::Path};
 
 use serde_json::Value;
 
-use crate::{path_guard, string_argument, truncate_output, workspace_root, AppState};
+use crate::{path_guard, string_argument, truncate_output, AppState};
 
 const CREATED_FILE_MARKER: &str = "__RUSTPILOT_CREATED__";
 const MAX_HISTORY_ENTRIES: usize = 20;
@@ -11,6 +11,7 @@ pub(crate) async fn run(
     state: &AppState,
     arguments: &Value,
     external_path_approved: bool,
+    workspace: &Path,
 ) -> Result<String, String> {
     let command = string_argument(arguments, "command")
         .ok_or_else(|| "rust_str_replace_editor requires command".to_string())?;
@@ -20,10 +21,9 @@ pub(crate) async fn run(
         command.as_str(),
         "create" | "str_replace" | "insert" | "undo_edit"
     ) {
-        path_guard::resolve_mutation_path(&workspace_root(), &raw_path, external_path_approved)?
-            .canonical
+        path_guard::resolve_mutation_path(workspace, &raw_path, external_path_approved)?.canonical
     } else {
-        path_guard::resolve_scoped_path(&workspace_root(), &raw_path)?
+        path_guard::resolve_scoped_path(workspace, &raw_path)?
     };
     match command.as_str() {
         "view" => view(&path, arguments).await,

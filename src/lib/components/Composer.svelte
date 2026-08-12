@@ -1,14 +1,28 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
+  import type { PhysicalPosition } from "@tauri-apps/api/dpi";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
-  import { ArrowUp, FileText, LoaderCircle, Paperclip, Square, X } from "lucide-svelte";
+  import {
+    ArrowUp,
+    Check,
+    ChevronDown,
+    FileText,
+    LoaderCircle,
+    Paperclip,
+    ShieldAlert,
+    ShieldCheck,
+    Square,
+    X
+  } from "lucide-svelte";
   import { fileMime, mimeForName, MAX_ATTACHMENTS, MAX_ATTACHMENT_BYTES } from "../attachments";
   import { isTauriRuntime } from "../api";
-  import type { AttachmentPathInput } from "../types";
+  import type { ApprovalMode, AttachmentPathInput } from "../types";
 
   export let busy = false;
   export let disabled = false;
   export let placeholder = "Describe a task...";
+  export let approvalMode: ApprovalMode = "guarded";
+  export let onApprovalModeChange: (mode: ApprovalMode) => Promise<boolean> | boolean = () => true;
   export let onSend:
     (prompt: string, files: File[], paths: AttachmentPathInput[]) => Promise<boolean> | boolean;
   export let onStop: () => void;
@@ -29,7 +43,10 @@
   let dragging = false;
   let submitting = false;
   let localError = "";
+  let approvalSaving = false;
+  let approvalMenu: HTMLDetailsElement;
   let removeNativeDrop: (() => void) | undefined;
+  let composerElement: HTMLFormElement;
 
   $: canSubmit =
     !busy &&
@@ -160,6 +177,59 @@
     return !disabled && !busy && !submitting;
   }
 
+  function nativeDropIsInside(position: PhysicalPosition): boolean {
+    if (!composerElement) return false;
+    const logical = position.toLogical(window.devicePixelRatio || 1);
+    const bounds = composerElement.getBoundingClientRect();
+    return (
+      logical.x >= bounds.left &&
+      logical.x <= bounds.right &&
+      logical.y >= bounds.top &&
+      logical.y <= bounds.bottom
+    );
+  }
+
+  function approvalModeName(mode: ApprovalMode): string {
+    return mode === "guarded" ? "Guarded" : "Confirm";
+  }
+
+  function toggleApprovalMenu(event: MouseEvent): void {
+    if (disabled || busy || submitting || approvalSaving) event.preventDefault();
+  }
+
+  function closeApprovalMenu(): void {
+    if (approvalMenu) approvalMenu.open = false;
+  }
+
+  function handleWindowClick(event: MouseEvent): void {
+    if (approvalMenu?.open && !approvalMenu.contains(event.target as Node)) closeApprovalMenu();
+  }
+
+  function handleWindowKeydown(event: KeyboardEvent): void {
+    if (event.key === "Escape" && approvalMenu?.open) {
+      closeApprovalMenu();
+      event.stopPropagation();
+    }
+  }
+
+  async function selectApprovalMode(mode: ApprovalMode): Promise<void> {
+    if (approvalSaving || disabled || busy || submitting) return;
+    if (mode === approvalMode) {
+      closeApprovalMenu();
+      return;
+    }
+    approvalSaving = true;
+    localError = "";
+    try {
+      const accepted = await onApprovalModeChange(mode);
+      if (accepted !== false) closeApprovalMenu();
+    } catch (error) {
+      localError = error instanceof Error ? error.message : String(error);
+    } finally {
+      approvalSaving = false;
+    }
+  }
+
   async function submit(): Promise<void> {
     const value = prompt.trim();
     if (!canSubmit) return;
@@ -199,11 +269,11 @@
     void getCurrentWebview()
       .onDragDropEvent((event) => {
         if (event.payload.type === "enter" || event.payload.type === "over") {
-          dragging = canAcceptFiles();
+          dragging = canAcceptFiles() && nativeDropIsInside(event.payload.position);
           return;
         }
         dragging = false;
-        if (event.payload.type === "drop" && canAcceptFiles()) {
+        if (event.payload.type === "drop" && canAcceptFiles() && nativeDropIsInside(event.payload.position)) {
           addNativePaths(event.payload.paths);
         }
       })
@@ -224,7 +294,10 @@
   onDestroy(clearAttachments);
 </script>
 
+<svelte:window on:click={handleWindowClick} on:keydown={handleWindowKeydown} />
+
 <form
+  bind:this={composerElement}
   class="composer"
   class:composer-dragging={dragging}
   on:submit|preventDefault={() => void submit()}
@@ -283,42 +356,97 @@
     on:paste={handlePaste}
   ></textarea>
 
-  <div class="composer-actions">
-    <button
-      class="attach-button"
-      type="button"
-      title="Attach files"
-      aria-label="Attach files"
-      disabled={disabled || busy || submitting}
-      on:click={openFilePicker}
-    >
-      <Paperclip size={17} />
-    </button>
-    {#if busy}
+  <div class="composer-toolbar">
+    <div class="composer-left-actions">
+      <details class="composer-approval" bind:this={approvalMenu}>
+        <summary
+          class="composer-approval-trigger"
+          class:composer-approval-disabled={disabled || busy || submitting || approvalSaving}
+          title={`Approval mode: ${approvalModeName(approvalMode)}`}
+          aria-label={`Approval mode: ${approvalModeName(approvalMode)}`}
+          on:click={toggleApprovalMenu}
+        >
+          {#if approvalMode === "guarded"}
+            <ShieldCheck size={16} />
+          {:else}
+            <ShieldAlert size={16} />
+          {/if}
+          <span class="composer-approval-label">{approvalModeName(approvalMode)}</span>
+          <ChevronDown size={14} class="composer-approval-chevron" />
+        </summary>
+        <div class="composer-approval-menu">
+          <div class="composer-approval-heading">
+            <strong>Permission mode</strong>
+            <span>Choose how much the agent pauses before sensitive work.</span>
+          </div>
+          <button
+            class:composer-approval-option-active={approvalMode === "guarded"}
+            class="composer-approval-option"
+            type="button"
+            disabled={approvalSaving}
+            on:click={() => void selectApprovalMode("guarded")}
+          >
+            <span class="composer-approval-option-icon"><ShieldCheck size={15} /></span>
+            <span class="composer-approval-option-copy">
+              <strong>Guarded</strong>
+              <small>Routine workspace work keeps moving; risky actions pause.</small>
+            </span>
+            {#if approvalMode === "guarded"}<Check size={15} />{/if}
+          </button>
+          <button
+            class:composer-approval-option-active={approvalMode === "confirm"}
+            class="composer-approval-option"
+            type="button"
+            disabled={approvalSaving}
+            on:click={() => void selectApprovalMode("confirm")}
+          >
+            <span class="composer-approval-option-icon composer-approval-option-icon-alert"><ShieldAlert size={15} /></span>
+            <span class="composer-approval-option-copy">
+              <strong>Confirm</strong>
+              <small>Ask before every action that can change state or reach outside.</small>
+            </span>
+            {#if approvalMode === "confirm"}<Check size={15} />{/if}
+          </button>
+        </div>
+      </details>
       <button
-        class="stop-button"
+        class="attach-button"
         type="button"
-        title="Stop task"
-        aria-label="Stop task"
-        on:click={onStop}
+        title="Attach files"
+        aria-label="Attach files"
+        disabled={disabled || busy || submitting}
+        on:click={openFilePicker}
       >
-        <Square size={16} fill="currentColor" />
+        <Paperclip size={17} />
       </button>
-    {:else if submitting}
-      <button class="send-button composer-submit-busy" type="button" disabled aria-label="Uploading attachments">
-        <LoaderCircle size={17} />
-      </button>
-    {:else}
-      <button
-        class="send-button"
-        type="submit"
-        title="Run task"
-        aria-label="Run task"
-        disabled={!canSubmit}
-      >
-        <ArrowUp size={18} />
-      </button>
-    {/if}
+    </div>
+    <div class="composer-actions">
+      {#if busy}
+        <button
+          class="stop-button"
+          type="button"
+          title="Stop task"
+          aria-label="Stop task"
+          on:click={onStop}
+        >
+          <Square size={16} fill="currentColor" />
+        </button>
+      {:else if submitting}
+        <button class="send-button composer-submit-busy" type="button" disabled aria-label="Uploading attachments">
+          <LoaderCircle size={17} />
+        </button>
+      {:else}
+        <button
+          class="send-button"
+          type="submit"
+          title="Run task"
+          aria-label="Run task"
+          disabled={!canSubmit}
+        >
+          <ArrowUp size={18} />
+        </button>
+      {/if}
+    </div>
   </div>
   {#if localError}
     <div class="composer-error" role="status">{localError}</div>

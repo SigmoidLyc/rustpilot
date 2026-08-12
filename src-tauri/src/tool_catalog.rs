@@ -15,7 +15,7 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
         ),
         function(
             "rust_code",
-            "Bounded repository coding operations: read files with line numbers, list directories, glob and literal-grep source files, inspect git status or diff, run bounded offline Cargo/npm diagnostics, and apply precise edits. Read operations stay inside the workspace; mutations and project checks require approval and use the existing path guard.",
+            "Bounded repository coding operations: read files with line numbers, list directories, glob and literal-grep source files, inspect git status or diff, run bounded offline Cargo/npm diagnostics, and apply precise edits. Read operations stay inside the workspace; sensitive mutations and project checks may require approval and use the existing path guard.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -72,7 +72,7 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
         ),
         function(
             "rust_shell",
-            "Run a local shell command. Every call requires explicit user approval.",
+            "Run a local shell command. Safe inspection commands may run automatically in guarded mode; unsafe commands require approval.",
             json!({
                 "type": "object",
                 "properties": {"command": {"type": "string"}, "cwd": {"type": "string"}},
@@ -81,7 +81,7 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
         ),
         function(
             "rust_bash",
-            "Run a persistent named shell session with a remembered working directory. Approval required.",
+            "Run a persistent named shell session with a remembered working directory. Unsafe commands require approval.",
             json!({
                 "type": "object",
                 "properties": {
@@ -95,7 +95,7 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
         ),
         function(
             "rust_str_replace_editor",
-            "View, create, replace, insert, and undo edits in files. Mutating commands require approval.",
+            "View, create, replace, insert, and undo edits in files. Sensitive mutations require approval; guarded mode can allow safe workspace edits.",
             json!({
                 "type": "object",
                 "properties": {
@@ -230,7 +230,7 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
         ),
         function(
             "rust_sandbox_files",
-            "Operate on files inside the RustPilot workspace sandbox. Mutating operations require approval.",
+            "Operate on files inside the RustPilot workspace sandbox. Safe sandbox mutations may run automatically in guarded mode.",
             json!({
                 "type": "object",
                 "properties": {"operation": {"type": "string", "enum": ["list", "read", "write", "delete", "exists"]}, "path": {"type": "string"}, "content": {"type": "string"}},
@@ -239,7 +239,7 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
         ),
         function(
             "rust_sandbox_shell",
-            "Run a command in a persistent RustPilot workspace sandbox shell. Approval required.",
+            "Run a command in a persistent RustPilot workspace sandbox shell. Unsafe commands require approval.",
             json!({
                 "type": "object",
                 "properties": {"command": {"type": "string"}, "session_id": {"type": "string"}, "cwd": {"type": "string"}},

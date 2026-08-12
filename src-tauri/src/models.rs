@@ -231,6 +231,12 @@ pub struct ApprovalRequest {
     pub details: String,
     pub created_at: i64,
     pub status: String,
+    #[serde(default)]
+    pub rememberable: bool,
+    #[serde(default)]
+    pub remember_action: Option<String>,
+    #[serde(default)]
+    pub remember_pattern: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +244,8 @@ pub struct Task {
     pub id: String,
     pub title: String,
     pub prompt: String,
+    #[serde(default)]
+    pub workspace: String,
     pub status: AgentStatus,
     pub created_at: i64,
     pub updated_at: i64,
@@ -272,12 +280,24 @@ pub struct Task {
 pub struct TaskSummary {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub workspace: String,
     pub status: AgentStatus,
     pub updated_at: i64,
     pub demo_mode: bool,
     #[serde(default)]
     pub archived: bool,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    pub id: String,
+    pub directory: String,
+    pub name: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub task_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,6 +332,27 @@ pub struct TaskPlanEvent {
     pub plan: AgentPlan,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    Confirm,
+    Guarded,
+}
+
+impl Default for ApprovalMode {
+    fn default() -> Self {
+        Self::Guarded
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalRule {
+    #[serde(default)]
+    pub workspace: String,
+    pub action: String,
+    pub resource: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSettings {
     pub api_base_url: String,
@@ -322,6 +363,10 @@ pub struct AgentSettings {
     pub timeout_secs: u64,
     #[serde(default)]
     pub prompt_cache: llm::PromptCacheMode,
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
+    #[serde(default)]
+    pub(crate) approval_rules: Vec<ApprovalRule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +378,10 @@ pub struct SettingsInput {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub prompt_cache: Option<llm::PromptCacheMode>,
+    #[serde(default)]
+    pub approval_mode: Option<ApprovalMode>,
+    #[serde(default)]
+    pub clear_approval_rules: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,6 +392,8 @@ pub struct SettingsView {
     pub max_steps: u32,
     pub timeout_secs: u64,
     pub prompt_cache: llm::PromptCacheMode,
+    pub approval_mode: ApprovalMode,
+    pub remembered_approvals: usize,
     pub demo_mode: bool,
     pub available_tools: Vec<AgentToolDefinition>,
 }
@@ -354,4 +405,7 @@ pub(crate) struct PersistedSettings {
     pub(crate) max_steps: Option<u32>,
     pub(crate) timeout_secs: Option<u64>,
     pub(crate) prompt_cache: Option<llm::PromptCacheMode>,
+    pub(crate) approval_mode: Option<ApprovalMode>,
+    #[serde(default)]
+    pub(crate) approval_rules: Vec<ApprovalRule>,
 }

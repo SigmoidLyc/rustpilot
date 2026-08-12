@@ -11,16 +11,15 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    sandbox_root_for_task, string_argument, truncate_output, workspace_root, AppState,
-    PersistentShell, MAX_OUTPUT_CHARS,
+    path_guard, sandbox_root_for_task, string_argument, truncate_output, AppState, PersistentShell,
+    MAX_OUTPUT_CHARS,
 };
 
-pub(crate) async fn run(arguments: &Value, forced_cwd: Option<&Path>) -> Result<String, String> {
+pub(crate) async fn run(arguments: &Value, default_cwd: Option<&Path>) -> Result<String, String> {
     let command = string_argument(arguments, "command")
         .ok_or_else(|| "rust_shell requires a command string".to_string())?;
-    let explicit_cwd = string_argument(arguments, "cwd").map(PathBuf::from);
-    let cwd = forced_cwd.or(explicit_cwd.as_deref());
-    run_process(&command, cwd).await
+    let cwd = resolve_cwd(arguments, default_cwd)?;
+    run_process(&command, cwd.as_deref()).await
 }
 
 pub(crate) async fn run_persistent(
@@ -28,36 +27,27 @@ pub(crate) async fn run_persistent(
     task_id: &str,
     arguments: &Value,
     sandbox_prefix: Option<&str>,
+    workspace: &Path,
 ) -> Result<String, String> {
     let command = string_argument(arguments, "command")
         .ok_or_else(|| "rust_bash requires a command string".to_string())?;
     let session_id =
         string_argument(arguments, "session_id").unwrap_or_else(|| "default".to_string());
-    let key = match sandbox_prefix {
-        Some(prefix) => format!("{prefix}:{task_id}:{session_id}"),
-        None => session_id.clone(),
-    };
+    let key = session_key(task_id, &session_id, sandbox_prefix, workspace);
     let restart = arguments
         .get("restart")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let sandbox_root = sandbox_prefix
-        .map(|_| sandbox_root_for_task(task_id))
+        .map(|_| sandbox_root_for_task(task_id, workspace))
         .transpose()?;
-    let initial_cwd = if let Some(raw_cwd) = string_argument(arguments, "cwd") {
-        let path = PathBuf::from(raw_cwd);
-        if let Some(root) = &sandbox_root {
-            if path.is_absolute() {
-                path
-            } else {
-                root.join(path)
-            }
-        } else {
-            path
-        }
-    } else {
-        sandbox_root.clone().unwrap_or_else(workspace_root)
-    };
+    let initial_cwd = initial_cwd(
+        task_id,
+        arguments,
+        sandbox_prefix,
+        sandbox_root.as_deref(),
+        workspace,
+    )?;
     if let Some(root) = &sandbox_root {
         let normalized = if initial_cwd.exists() {
             initial_cwd
@@ -81,6 +71,14 @@ pub(crate) async fn run_persistent(
     if restart {
         sessions.remove(&key);
     }
+    if let Some(root) = &sandbox_root {
+        if sessions
+            .get(&key)
+            .is_some_and(|shell| ensure_sandbox_cwd(root, &shell.cwd).is_err())
+        {
+            sessions.remove(&key);
+        }
+    }
     let should_spawn = match sessions.get_mut(&key) {
         Some(shell) => shell
             .child
@@ -95,6 +93,9 @@ pub(crate) async fn run_persistent(
     let shell = sessions
         .get_mut(&key)
         .ok_or_else(|| "Persistent shell session was not created.".to_string())?;
+    if let Some(root) = &sandbox_root {
+        ensure_sandbox_cwd(root, &shell.cwd)?;
+    }
     let sentinel = format!("__RUSTPILOT_DONE_{}__", Uuid::new_v4().simple());
     #[cfg(target_os = "windows")]
     let payload = format!("{command} 2>&1\r\necho {sentinel}:%errorlevel%:%CD%\r\n");
@@ -138,11 +139,123 @@ pub(crate) async fn run_persistent(
         }
     };
     let cwd = shell.cwd.clone();
+    if let Some(root) = &sandbox_root {
+        if let Err(error) = ensure_sandbox_cwd(root, &cwd) {
+            sessions.remove(&key);
+            return Err(error);
+        }
+    }
     Ok(format!(
         "session: {session_id}\ncwd: {}\nexit_code: {exit_code}\n{}",
         cwd.display(),
         truncate_output(&output)
     ))
+}
+
+pub(crate) async fn effective_cwd(
+    state: &AppState,
+    task_id: &str,
+    arguments: &Value,
+    sandbox_prefix: Option<&str>,
+    workspace: &Path,
+) -> Result<PathBuf, String> {
+    let session_id =
+        string_argument(arguments, "session_id").unwrap_or_else(|| "default".to_string());
+    let key = session_key(task_id, &session_id, sandbox_prefix, workspace);
+    let sessions = state.shell_sessions.lock().await;
+    if let Some(shell) = sessions.get(&key) {
+        return Ok(shell.cwd.clone());
+    }
+    drop(sessions);
+
+    let sandbox_root = sandbox_prefix
+        .map(|_| sandbox_root_for_task(task_id, workspace))
+        .transpose()?;
+    initial_cwd(
+        task_id,
+        arguments,
+        sandbox_prefix,
+        sandbox_root.as_deref(),
+        workspace,
+    )
+}
+
+pub(crate) fn session_key(
+    task_id: &str,
+    session_id: &str,
+    sandbox_prefix: Option<&str>,
+    workspace: &Path,
+) -> String {
+    match sandbox_prefix {
+        Some(prefix) => format!("{prefix}:{}:{task_id}:{session_id}", workspace.display()),
+        None => format!("workspace:{}:{task_id}:{session_id}", workspace.display()),
+    }
+}
+
+fn initial_cwd(
+    _task_id: &str,
+    arguments: &Value,
+    sandbox_prefix: Option<&str>,
+    sandbox_root: Option<&Path>,
+    workspace: &Path,
+) -> Result<PathBuf, String> {
+    let initial_cwd = if let Some(raw_cwd) = string_argument(arguments, "cwd") {
+        let path = PathBuf::from(raw_cwd);
+        if let Some(root) = sandbox_root {
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        } else {
+            workspace.join(path)
+        }
+    } else {
+        sandbox_root
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| workspace.to_path_buf())
+    };
+    if let Some(root) = sandbox_root {
+        let normalized = if initial_cwd.exists() {
+            initial_cwd
+                .canonicalize()
+                .map_err(|error| format!("Unable to resolve sandbox cwd: {error}"))?
+        } else {
+            initial_cwd.clone()
+        };
+        if !normalized.starts_with(root) {
+            return Err("Sandbox shell cwd must stay inside the task sandbox.".to_string());
+        }
+    }
+    if sandbox_prefix.is_some() && !initial_cwd.is_dir() {
+        return Err(format!(
+            "Shell working directory does not exist: {}",
+            initial_cwd.display()
+        ));
+    }
+    Ok(initial_cwd)
+}
+
+fn resolve_cwd(arguments: &Value, default_cwd: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let Some(raw_cwd) = string_argument(arguments, "cwd") else {
+        return Ok(default_cwd.map(Path::to_path_buf));
+    };
+    let requested = PathBuf::from(raw_cwd);
+    if requested.is_absolute() {
+        Ok(Some(requested))
+    } else {
+        Ok(Some(
+            default_cwd
+                .map(|root| root.join(&requested))
+                .unwrap_or(requested),
+        ))
+    }
+}
+
+fn ensure_sandbox_cwd(root: &Path, cwd: &Path) -> Result<(), String> {
+    path_guard::resolve_scoped_path(root, &cwd.to_string_lossy())
+        .map(|_| ())
+        .map_err(|error| format!("Sandbox shell cwd escaped its task sandbox: {error}"))
 }
 
 async fn run_process(command: &str, cwd: Option<&Path>) -> Result<String, String> {
@@ -212,4 +325,43 @@ async fn spawn(cwd: &Path) -> Result<PersistentShell, String> {
         stdout: BufReader::new(stdout),
         cwd: cwd.to_path_buf(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace_root;
+
+    #[tokio::test]
+    async fn effective_cwd_follows_a_persistent_session() {
+        let state = AppState::new();
+        let session_id = format!("approval-cwd-{}", Uuid::new_v4().simple());
+        let target = std::env::temp_dir();
+        let command = if cfg!(windows) {
+            format!("cd /d \"{}\"", target.display())
+        } else {
+            format!("cd \"{}\"", target.display())
+        };
+
+        run_persistent(
+            &state,
+            "approval-cwd-task",
+            &serde_json::json!({"command": command, "session_id": session_id}),
+            None,
+            &workspace_root(),
+        )
+        .await
+        .expect("persistent shell should change its cwd");
+
+        let cwd = effective_cwd(
+            &state,
+            "approval-cwd-task",
+            &serde_json::json!({"command": "dir", "session_id": session_id}),
+            None,
+            &workspace_root(),
+        )
+        .await
+        .expect("effective cwd should be available");
+        assert_eq!(cwd.canonicalize().unwrap(), target.canonicalize().unwrap());
+    }
 }
