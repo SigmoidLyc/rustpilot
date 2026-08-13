@@ -4,7 +4,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     sync::atomic::AtomicU64,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -218,7 +218,6 @@ impl AppState {
         }
         let projects_path = data_dir.join(project_store::PROJECTS_FILE);
         let loaded_projects = project_store::ProjectStore::load(&projects_path);
-        let migrate_projects = loaded_projects.is_none();
         {
             let mut projects = self
                 .projects
@@ -337,24 +336,17 @@ impl AppState {
                 .projects
                 .write()
                 .map_err(|_| "Project lock is poisoned".to_string())?;
-            let mut changed = false;
-            if migrate_projects {
-                // Pre-project-store task history had no explicit open/closed state.
-                // Seed it once, then preserve user close decisions across restarts.
-                let timestamp = now();
-                let current = workspace_root();
-                if current.is_dir() {
-                    changed |= projects.open(&current, timestamp);
-                }
-                let mut task_workspaces = loaded_tasks
-                    .values()
-                    .filter(|task| Path::new(&task.workspace).is_dir())
-                    .collect::<Vec<_>>();
-                task_workspaces.sort_by_key(|task| Reverse(task.updated_at));
-                for task in task_workspaces {
-                    changed |= projects.open(Path::new(&task.workspace), timestamp);
-                }
-            }
+            // Build output directories are implementation artifacts, never user projects.
+            let open_before = projects.open.len();
+            projects
+                .open
+                .retain(|record| !is_rustpilot_artifact_directory(Path::new(&record.directory)));
+            let closed_before = projects.recently_closed.len();
+            projects
+                .recently_closed
+                .retain(|record| !is_rustpilot_artifact_directory(Path::new(&record.directory)));
+            let changed = open_before != projects.open.len()
+                || closed_before != projects.recently_closed.len();
             drop(projects);
             if changed {
                 self.persist_projects()?;
@@ -998,16 +990,15 @@ fn repair_task_record(task: &mut Task) -> bool {
 }
 
 fn normalized_task_workspace(raw: &str) -> String {
-    let fallback = workspace_root();
     let requested = if raw.trim().is_empty() {
-        fallback
+        workspace_root()
     } else {
         PathBuf::from(raw)
     };
     let resolved = requested
         .canonicalize()
         .ok()
-        .filter(|path| path.is_dir())
+        .filter(|path| path.is_dir() && !is_rustpilot_artifact_directory(path))
         .unwrap_or_else(workspace_root);
     project_store::display_directory(&resolved)
 }
@@ -2027,7 +2018,121 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 fn workspace_root() -> PathBuf {
-    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(resolve_default_workspace_root).clone()
+}
+
+fn resolve_default_workspace_root() -> PathBuf {
+    if let Some(configured) = env::var_os("RUSTPILOT_WORKSPACE") {
+        let configured = PathBuf::from(configured);
+        if !is_rustpilot_artifact_directory(&configured) {
+            if let Some(directory) = prepare_workspace_directory(&configured) {
+                return directory;
+            }
+        }
+    }
+
+    if let Ok(current) = env::current_dir() {
+        if current.is_dir()
+            && !is_cargo_target_directory(&current)
+            && !is_rustpilot_artifact_directory(&current)
+        {
+            return canonical_or_original(current);
+        }
+    }
+
+    stable_workspace_directory()
+}
+
+fn prepare_workspace_directory(path: &Path) -> Option<PathBuf> {
+    fs::create_dir_all(path).ok()?;
+    fs::metadata(path)
+        .ok()?
+        .is_dir()
+        .then(|| canonical_or_original(path.to_path_buf()))
+}
+
+fn stable_workspace_directory() -> PathBuf {
+    let mut candidates = Vec::with_capacity(3);
+    if let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) {
+        candidates.push(PathBuf::from(home).join("Documents").join("RustPilot"));
+    }
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        candidates.push(
+            PathBuf::from(local_app_data)
+                .join("RustPilot")
+                .join("workspace"),
+        );
+    }
+    let temporary = env::temp_dir().join("RustPilot").join("workspace");
+    candidates.push(temporary.clone());
+
+    candidates
+        .into_iter()
+        .filter(|candidate| !is_rustpilot_artifact_directory(candidate))
+        .find_map(|candidate| prepare_workspace_directory(&candidate))
+        .unwrap_or(temporary)
+}
+
+fn canonical_or_original(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
+}
+
+fn is_cargo_target_directory(path: &Path) -> bool {
+    let Some(profile_directory) = cargo_profile_directory() else {
+        return false;
+    };
+    let Some(profile_name) = profile_directory.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !matches!(
+        profile_name.to_ascii_lowercase().as_str(),
+        "debug" | "release"
+    ) {
+        return false;
+    }
+    is_same_or_inside_path(path, &profile_directory)
+}
+
+fn cargo_profile_directory() -> Option<PathBuf> {
+    env::current_exe().ok()?.ancestors().find_map(|path| {
+        let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+        matches!(name.as_str(), "debug" | "release").then(|| path.to_path_buf())
+    })
+}
+
+fn comparable_path(path: &Path) -> String {
+    let canonical = canonical_or_original(path.to_path_buf());
+    let mut value = canonical.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        value = value
+            .strip_prefix("//?/UNC/")
+            .map(|rest| format!("//{rest}"))
+            .or_else(|| value.strip_prefix("//?/").map(ToString::to_string))
+            .unwrap_or(value);
+        value.make_ascii_lowercase();
+    }
+    while value.len() > 1 && value.ends_with('/') {
+        value.pop();
+    }
+    value
+}
+
+fn is_same_or_inside_path(path: &Path, root: &Path) -> bool {
+    let path = comparable_path(path);
+    let root = comparable_path(root);
+    path == root || path.starts_with(&(root + "/"))
+}
+
+fn is_rustpilot_artifact_directory(path: &Path) -> bool {
+    if is_cargo_target_directory(path) {
+        return true;
+    }
+    env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(Path::to_path_buf))
+        .is_some_and(|executable_directory| is_same_or_inside_path(path, &executable_directory))
 }
 
 fn sandbox_root_for_task(task_id: &str, workspace: &Path) -> Result<PathBuf, String> {
@@ -3799,6 +3904,9 @@ fn project_summaries(
 
 fn open_project_internal(state: &AppState, raw_path: &str) -> Result<ProjectSummary, String> {
     let directory = project_store::normalize_directory(raw_path)?;
+    if is_rustpilot_artifact_directory(&directory) {
+        return Err("RustPilot build output cannot be used as a project workspace.".to_string());
+    }
     let timestamp = now();
     let changed = {
         let mut projects = state
@@ -4027,6 +4135,11 @@ fn create_task_internal(
     let workspace = match workspace_raw.as_deref() {
         Some(raw) => project_store::normalize_directory(raw)?,
         None => project_store::normalize_directory(&fallback_workspace.to_string_lossy())?,
+    };
+    let workspace = if is_rustpilot_artifact_directory(&workspace) {
+        fallback_workspace
+    } else {
+        workspace
     };
     open_project_internal(state, &workspace.to_string_lossy())?;
     let demo_mode = false;

@@ -504,7 +504,7 @@
       archivedTasks = loadedArchivedTasks;
       projects = loadedProjects;
       recentlyClosedProjects = loadedRecentProjects;
-      selectedWorkspace = loadedProjects[0]?.directory ?? loadedTasks[0]?.workspace ?? "";
+      selectedWorkspace = loadedProjects[0]?.directory ?? "";
       settings = loadedSettings;
     } catch (error) {
       runtimeError = error instanceof Error ? error.message : String(error);

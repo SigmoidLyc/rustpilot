@@ -251,7 +251,7 @@ async function start() {
     const cargo = process.platform === "win32" ? "cargo.exe" : "cargo";
     await Promise.all([waitForVite(vite), buildApplication(cargo)]);
 
-    const app = spawn(process.execPath, [appLauncher, executable, targetDir, String(vite.pid), leasePath, vite.token], {
+    const app = spawn(process.execPath, [appLauncher, executable, root, String(vite.pid), leasePath, vite.token], {
       cwd: root,
       detached: true,
       windowsHide: true,

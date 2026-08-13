@@ -522,6 +522,15 @@ fn system_prompt_is_split_into_stable_cacheable_parts() {
 }
 
 #[test]
+fn cargo_output_directories_are_not_workspace_candidates() {
+    let profile = cargo_profile_directory().expect("test executable should have a Cargo profile");
+    assert!(is_cargo_target_directory(&profile));
+    assert!(is_rustpilot_artifact_directory(&profile));
+    assert!(is_cargo_target_directory(&profile.join("nested")));
+    assert!(!is_cargo_target_directory(Path::new("src")));
+}
+
+#[test]
 fn agent_kind_tracks_agent_specializations() {
     assert_eq!(
         infer_agent_kind("Analyze this CSV and draw a chart"),

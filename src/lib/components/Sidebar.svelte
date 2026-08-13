@@ -178,15 +178,6 @@
 >
   <div class="sidebar-heading">
     <div class="section-label"><ListTodo size={15} strokeWidth={2} /> Projects</div>
-    <button
-      class="icon-button compact"
-      type="button"
-      title="New task"
-      aria-label="New task"
-      on:click={onNewTask}
-    >
-      <FilePlus2 size={16} />
-    </button>
   </div>
 
   <button class="new-task-button" type="button" on:click={onNewTask}>
