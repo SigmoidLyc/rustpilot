@@ -78,11 +78,12 @@ use tool_policy::{
     approval_details, approval_reason, external_path_requested, needs_approval, rule_for,
     sanitize_rules,
 };
-#[cfg(test)]
-use tool_registry::tool_schema_hash;
 use tool_registry::{
-    available_tool_views, tool_definitions_for_state, McpToolDefinition, ToolDefinitionCache,
+    agent_has_tool, available_tool_views, tool_definitions_for_agent, McpToolDefinition,
+    ToolDefinitionCache,
 };
+#[cfg(test)]
+use tool_registry::{tool_definitions_for_state, tool_schema_hash};
 
 const SETTINGS_FILE: &str = "settings.json";
 const MAX_OUTPUT_CHARS: usize = 16_000;
@@ -677,12 +678,16 @@ fn memory_from_task_messages(messages: &[TaskMessage]) -> Vec<AgentMemoryEntry> 
             matches!(message.role.as_str(), "user" | "assistant" | "tool")
                 && !(message.role == "assistant"
                     && message.content.trim().is_empty()
+                    && message.reasoning.trim().is_empty()
+                    && message.reasoning_opaque.is_none()
                     && message.tool_calls.is_empty())
         })
         .map(|message| AgentMemoryEntry {
             id: message.id.clone(),
             role: message.role.clone(),
             content: message.content.clone(),
+            reasoning: message.reasoning.clone(),
+            reasoning_opaque: message.reasoning_opaque.clone(),
             created_at: message.created_at,
             tool_call_id: message.tool_call_id.clone(),
             tool_names: message
@@ -706,6 +711,8 @@ fn recovered_tool_result(call: &agent::MessageToolCall) -> AgentMemoryEntry {
             "[RustPilot] No result was recorded for the previous `{}` call because that run ended before the tool completed. Treat it as unsuccessful and continue from the available evidence.",
             call.function.name
         ),
+        reasoning: String::new(),
+        reasoning_opaque: None,
         created_at: now(),
         tool_call_id: Some(call.id.clone()),
         tool_names: vec![call.function.name.clone()],
@@ -954,6 +961,8 @@ fn repair_task_record(task: &mut Task) -> bool {
                 id: new_id("memory"),
                 role: "user".to_string(),
                 content: task.prompt.clone(),
+                reasoning: String::new(),
+                reasoning_opaque: None,
                 created_at: task.created_at,
                 tool_call_id: None,
                 tool_names: Vec::new(),
@@ -1095,6 +1104,8 @@ fn record_memory(
         MemoryRecord {
             role: role.to_string(),
             content,
+            reasoning: String::new(),
+            reasoning_opaque: None,
             tool_call_id,
             tool_names,
             tool_calls: Vec::new(),
@@ -1108,6 +1119,8 @@ fn record_memory(
 struct MemoryRecord {
     role: String,
     content: String,
+    reasoning: String,
+    reasoning_opaque: Option<String>,
     tool_call_id: Option<String>,
     tool_names: Vec<String>,
     tool_calls: Vec<agent::MessageToolCall>,
@@ -1128,6 +1141,8 @@ fn record_memory_full(state: &AppState, task_id: &str, record: MemoryRecord) -> 
         id: new_id("memory"),
         role: record.role,
         content: record.content,
+        reasoning: record.reasoning,
+        reasoning_opaque: record.reasoning_opaque,
         created_at: now(),
         tool_call_id: record.tool_call_id,
         tool_names: record.tool_names,
@@ -1293,6 +1308,8 @@ fn add_message(
         task_id: task_id.to_string(),
         role: role.to_string(),
         content,
+        reasoning: String::new(),
+        reasoning_opaque: None,
         created_at: now(),
         streaming,
         parts: Vec::new(),
@@ -1331,6 +1348,8 @@ fn add_tool_message(
         task_id: task_id.to_string(),
         role: "tool".to_string(),
         content,
+        reasoning: String::new(),
+        reasoning_opaque: None,
         created_at: now(),
         streaming: false,
         parts: Vec::new(),
@@ -1365,8 +1384,18 @@ fn rebuild_assistant_parts(message: &mut TaskMessage) {
         return;
     }
     let mut parts = Vec::with_capacity(
-        (if message.content.is_empty() { 0 } else { 1 }) + message.tool_calls.len(),
+        (if message.reasoning.is_empty() { 0 } else { 1 })
+            + (if message.content.is_empty() { 0 } else { 1 })
+            + message.tool_calls.len(),
     );
+    let reasoning_end = utf16_len(&message.reasoning);
+    if reasoning_end > 0 {
+        parts.push(AssistantPart::Reasoning {
+            id: format!("{}:reasoning", message.id),
+            start: 0,
+            end: reasoning_end,
+        });
+    }
     let content_end = utf16_len(&message.content);
     if content_end > 0 {
         parts.push(AssistantPart::Text {
@@ -1394,6 +1423,26 @@ fn ensure_assistant_parts(message: &mut TaskMessage) {
 
 fn apply_stream_event(message: &mut TaskMessage, event: &llm::StreamEvent) {
     match event {
+        llm::StreamEvent::ReasoningDelta(delta) if !delta.is_empty() => {
+            ensure_assistant_parts(message);
+            let start = match message.parts.last() {
+                Some(AssistantPart::Reasoning { end, .. }) => *end,
+                _ => utf16_len(&message.reasoning),
+            };
+            let end = start + utf16_len(delta);
+            message.reasoning.push_str(delta);
+            if let Some(AssistantPart::Reasoning { end: part_end, .. }) = message.parts.last_mut() {
+                if *part_end == start {
+                    *part_end = end;
+                    return;
+                }
+            }
+            message.parts.push(AssistantPart::Reasoning {
+                id: new_id("part"),
+                start,
+                end,
+            });
+        }
         llm::StreamEvent::TextDelta(delta) if !delta.is_empty() => {
             ensure_assistant_parts(message);
             let start = match message.parts.last() {
@@ -1413,6 +1462,9 @@ fn apply_stream_event(message: &mut TaskMessage, event: &llm::StreamEvent) {
                 start,
                 end,
             });
+        }
+        llm::StreamEvent::ReasoningOpaque(value) if !value.is_empty() => {
+            message.reasoning_opaque = Some(value.clone());
         }
         llm::StreamEvent::ToolCallDelta {
             index,
@@ -1488,7 +1540,9 @@ fn append_stream_event(
     message_id: &str,
     event: &llm::StreamEvent,
 ) -> Result<(), String> {
-    if matches!(event, llm::StreamEvent::TextDelta(delta) if delta.is_empty()) {
+    if matches!(event, llm::StreamEvent::ReasoningDelta(delta) | llm::StreamEvent::TextDelta(delta) if delta.is_empty())
+        || matches!(event, llm::StreamEvent::ReasoningOpaque(value) if value.is_empty())
+    {
         return Ok(());
     }
     let (message, revision) = {
@@ -1510,6 +1564,8 @@ fn append_stream_event(
                     task_id: task_id.to_string(),
                     role: "assistant".to_string(),
                     content: String::new(),
+                    reasoning: String::new(),
+                    reasoning_opaque: None,
                     created_at: now(),
                     streaming: true,
                     parts: Vec::new(),
@@ -1623,6 +1679,8 @@ fn attach_tool_calls_to_last_message(
                 task_id: task_id.to_string(),
                 role: "assistant".to_string(),
                 content: String::new(),
+                reasoning: String::new(),
+                reasoning_opaque: None,
                 created_at: now(),
                 streaming: false,
                 parts: Vec::new(),
@@ -2246,6 +2304,9 @@ async fn perform_tool(
 ) -> Result<ToolResult, AgentError> {
     let name = invocation.name.as_str();
     let arguments = &invocation.arguments;
+    let task = task_snapshot(state, task_id).map_err(AgentError::Message)?;
+    let agent_kind = agent::parse_agent_kind(&task.agent_kind).unwrap_or(agent::AgentKind::Manus);
+    let agent_spec = agents::AgentSpec::for_kind(agent_kind, &task.workspace);
     let tool_call_id = add_tool_call(
         app,
         state,
@@ -2264,7 +2325,41 @@ async fn perform_tool(
         .unwrap_or(&tool_call_id)
         .to_string();
 
-    let task = task_snapshot(state, task_id).map_err(AgentError::Message)?;
+    if !agent_has_tool(state, &agent_spec, name) {
+        let error = format!(
+            "Tool `{name}` is not available to the `{}` agent.",
+            agent_spec.key
+        );
+        let result = finish_tool_call(
+            app,
+            state,
+            task_id,
+            &tool_call_id,
+            ToolCallStatus::Failed,
+            None,
+            Some(error.clone()),
+        )
+        .map_err(AgentError::Message)?;
+        let _ = add_tool_message(
+            app,
+            state,
+            task_id,
+            name,
+            &memory_tool_call_id,
+            format!("{name} rejected: {error}"),
+        );
+        record_memory(
+            state,
+            task_id,
+            "tool",
+            error,
+            Some(memory_tool_call_id),
+            vec![name.to_string()],
+        )
+        .map_err(AgentError::Message)?;
+        return Ok(result);
+    }
+
     let task_workspace = task_workspace(&task);
     let attachment_read_paths =
         task_attachment_read_paths(state, &task).map_err(AgentError::Message)?;
@@ -2901,6 +2996,10 @@ struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_opaque: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ChatToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
@@ -2928,6 +3027,8 @@ struct ChatFunction {
 struct Completion {
     message_id: String,
     content: String,
+    reasoning: String,
+    reasoning_opaque: Option<String>,
     tool_calls: Vec<ChatToolCall>,
 }
 
@@ -2946,6 +3047,11 @@ fn memory_to_chat_messages(memory: &[AgentMemoryEntry]) -> Vec<ChatMessage> {
                 } else {
                     None
                 },
+                reasoning_content: (entry.role == "assistant" && !entry.reasoning.is_empty())
+                    .then_some(entry.reasoning.clone()),
+                reasoning_opaque: (entry.role == "assistant")
+                    .then(|| entry.reasoning_opaque.clone())
+                    .flatten(),
                 tool_calls: (!entry.tool_calls.is_empty()).then_some(
                     entry
                         .tool_calls
@@ -3152,9 +3258,10 @@ fn record_task_llm_usage(
             .ok_or_else(|| "Task not found".to_string())?;
         task.llm_usage.record(
             completion.prompt_tokens.unwrap_or(fallback_input),
-            completion
-                .completion_tokens
-                .unwrap_or_else(|| llm::TokenCounter::count_text(&completion.content)),
+            completion.completion_tokens.unwrap_or_else(|| {
+                llm::TokenCounter::count_text(&completion.content)
+                    + llm::TokenCounter::count_text(&completion.reasoning)
+            }),
             completion.cached_input_tokens,
             completion.cache_write_tokens,
         );
@@ -3168,11 +3275,12 @@ async fn stream_openai(
     state: &AppState,
     task_id: &str,
     settings: &AgentSettings,
+    agent_spec: &agents::AgentSpec,
     messages: &[ChatMessage],
     cancel: &CancellationToken,
 ) -> Result<Completion, AgentError> {
     validate_chat_message_context(messages).map_err(AgentError::Message)?;
-    let tools = tool_definitions_for_state(state);
+    let tools = tool_definitions_for_agent(state, agent_spec);
     let client = llm::OpenAiCompatibleClient::new(llm_settings_for_task(
         settings,
         task_id,
@@ -3185,11 +3293,17 @@ async fn stream_openai(
         .map_err(|_| AgentError::Message("Storage lock is poisoned".to_string()))?
         .clone()
         .ok_or_else(|| AgentError::Message("Attachment storage is not initialized.".to_string()))?;
-    let request_messages = messages
+    let mut request_messages = messages
         .iter()
         .map(|message| chat_message_value(message, &data_dir, client.supports_images()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(AgentError::Message)?;
+    let copilot_reasoning = client.uses_copilot_reasoning();
+    llm::sanitize_openai_messages_for_provider(
+        &mut request_messages,
+        copilot_reasoning,
+        client.uses_strict_assistant_history(),
+    );
     // Publish the assistant turn before waiting for the first token so the UI can show progress.
     let message = add_message(app, state, task_id, "assistant", String::new(), true)
         .map_err(AgentError::Message)?;
@@ -3234,6 +3348,8 @@ async fn stream_openai(
     Ok(Completion {
         message_id,
         content: completion.content,
+        reasoning: completion.reasoning,
+        reasoning_opaque: completion.reasoning_opaque,
         tool_calls: completion
             .tool_calls
             .into_iter()
@@ -3282,6 +3398,8 @@ async fn run_real(
         ChatMessage {
             role: "system".to_string(),
             content: Some(system_header),
+            reasoning_content: None,
+            reasoning_opaque: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -3290,6 +3408,8 @@ async fn run_real(
         ChatMessage {
             role: "system".to_string(),
             content: Some(system_policy),
+            reasoning_content: None,
+            reasoning_opaque: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -3302,6 +3422,8 @@ async fn run_real(
         messages.push(ChatMessage {
             role: "user".to_string(),
             content: Some(task.prompt.clone()),
+            reasoning_content: None,
+            reasoning_opaque: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -3323,12 +3445,12 @@ async fn run_real(
     let agent_spec = agents::AgentSpec::for_kind(agent_kind, &task.workspace);
     let max_steps = normalize_max_steps(settings.max_steps);
     let mut runtime = agent::ToolCallAgentRuntime::new(task.agent_name.clone(), system_prompt);
-    runtime.base.description = agent_spec.description;
-    runtime.base.next_step_prompt = agent_spec.next_step_prompt;
+    runtime.base.description = agent_spec.description.clone();
+    runtime.base.next_step_prompt = agent_spec.next_step_prompt.clone();
     runtime.base.max_steps = max_steps;
     runtime.base.memory.max_messages = MAX_MEMORY_ENTRIES;
     runtime.max_observe = agent_spec.max_observe;
-    runtime.special_tool_names = agent_spec.special_tool_names;
+    runtime.special_tool_names = agent_spec.special_tool_names.clone();
     runtime.base.begin().map_err(AgentError::Message)?;
     let mut latest_answer = String::new();
     let mut repeated_signatures: HashMap<String, u32> = HashMap::new();
@@ -3355,8 +3477,16 @@ async fn run_real(
             )
             .map_err(AgentError::Message)?
         };
-        let mut completion =
-            stream_openai(app, state, &task.id, settings, &messages, cancel).await?;
+        let mut completion = stream_openai(
+            app,
+            state,
+            &task.id,
+            settings,
+            &agent_spec,
+            &messages,
+            cancel,
+        )
+        .await?;
         let tool_call_count = completion.tool_calls.len();
         completion
             .tool_calls
@@ -3392,8 +3522,10 @@ async fn run_real(
                 },
             })
             .collect::<Vec<_>>();
-        runtime.set_response(
+        runtime.set_response_with_reasoning_metadata(
             (!completion.content.is_empty()).then_some(completion.content.clone()),
+            (!completion.reasoning.is_empty()).then_some(completion.reasoning.clone()),
+            completion.reasoning_opaque.clone(),
             memory_tool_calls.clone(),
         );
         record_memory_full(
@@ -3402,6 +3534,8 @@ async fn run_real(
             MemoryRecord {
                 role: "assistant".to_string(),
                 content: completion.content.clone(),
+                reasoning: completion.reasoning.clone(),
+                reasoning_opaque: completion.reasoning_opaque.clone(),
                 tool_call_id: None,
                 tool_names: completion
                     .tool_calls
@@ -3433,6 +3567,8 @@ async fn run_real(
             messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: Some(stuck_message.to_string()),
+                reasoning_content: None,
+                reasoning_opaque: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -3462,6 +3598,9 @@ async fn run_real(
         let assistant_message = ChatMessage {
             role: "assistant".to_string(),
             content: (!completion.content.is_empty()).then_some(completion.content.clone()),
+            reasoning_content: (!completion.reasoning.is_empty())
+                .then_some(completion.reasoning.clone()),
+            reasoning_opaque: completion.reasoning_opaque.clone(),
             tool_calls: (!completion.tool_calls.is_empty())
                 .then_some(completion.tool_calls.clone()),
             tool_call_id: None,
@@ -3481,26 +3620,9 @@ async fn run_real(
             )
             .map_err(AgentError::Message)?;
             if latest_answer.is_empty() {
-                latest_answer =
-                    "The model completed the run without a streamed final message.".to_string();
-                add_message(
-                    app,
-                    state,
-                    &task.id,
-                    "assistant",
-                    latest_answer.clone(),
-                    false,
-                )
-                .map_err(AgentError::Message)?;
-                record_memory(
-                    state,
-                    &task.id,
-                    "assistant",
-                    latest_answer.clone(),
-                    None,
-                    Vec::new(),
-                )
-                .map_err(AgentError::Message)?;
+                let message = "The provider completed without a final answer or tool call.";
+                runtime.base.fail();
+                return Err(AgentError::Message(message.to_string()));
             }
             runtime.base.finish();
             set_plan_step_status(
@@ -3622,6 +3744,8 @@ async fn run_real(
             messages.push(ChatMessage {
                 role: "tool".to_string(),
                 content: Some(tool_content),
+                reasoning_content: None,
+                reasoning_opaque: None,
                 tool_calls: None,
                 tool_call_id: Some(tool_call.id.clone()),
                 name: Some(tool_call.function.name.clone()),
@@ -3655,6 +3779,8 @@ async fn run_real(
             messages.push(ChatMessage {
                 role: "user".to_string(),
                 content: Some(task.prompt.clone()),
+                reasoning_content: None,
+                reasoning_opaque: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -4164,6 +4290,8 @@ fn create_task_internal(
             task_id: task_id.clone(),
             role: "user".to_string(),
             content: prompt.clone(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at,
             streaming: false,
             parts: Vec::new(),
@@ -4177,6 +4305,8 @@ fn create_task_internal(
             id: new_id("memory"),
             role: "user".to_string(),
             content: prompt.clone(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at,
             tool_call_id: None,
             tool_names: Vec::new(),
@@ -4238,6 +4368,8 @@ fn create_task_internal(
             task_id: task_id.clone(),
             role: "user".to_string(),
             content: String::new(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at,
             streaming: false,
             parts: Vec::new(),
@@ -4320,6 +4452,8 @@ fn continue_task_internal(
         task_id: task_id.clone(),
         role: "user".to_string(),
         content: prompt.clone(),
+        reasoning: String::new(),
+        reasoning_opaque: None,
         created_at,
         streaming: false,
         parts: Vec::new(),
@@ -4333,6 +4467,8 @@ fn continue_task_internal(
         id: new_id("memory"),
         role: "user".to_string(),
         content: prompt,
+        reasoning: String::new(),
+        reasoning_opaque: None,
         created_at,
         tool_call_id: None,
         tool_names: Vec::new(),
@@ -4466,6 +4602,8 @@ async fn retry_task(
             id: new_id("memory"),
             role: "user".to_string(),
             content: task.prompt.clone(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at: now(),
             tool_call_id: None,
             tool_names: Vec::new(),
@@ -4484,6 +4622,8 @@ async fn retry_task(
             task_id: task_id.clone(),
             role: "system".to_string(),
             content: "Retrying this task with the current settings.".to_string(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at: now(),
             streaming: false,
             parts: Vec::new(),

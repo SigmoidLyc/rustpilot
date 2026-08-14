@@ -78,6 +78,8 @@ fn test_task(task_id: &str) -> Task {
             task_id: task_id.to_string(),
             role: "assistant".to_string(),
             content: String::new(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at: 1,
             streaming: false,
             parts: Vec::new(),
@@ -175,6 +177,64 @@ fn sqlite_replays_stream_events_without_rewriting_the_task_snapshot() {
     let loaded = load_task_store(&directory).expect("stream event should replay");
     assert_eq!(loaded.tasks["task-1"].messages[0].content, "hello");
     assert!(loaded.event_bytes["task-1"] > 0);
+
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn sqlite_replays_reasoning_stream_events_without_losing_order() {
+    let directory =
+        std::env::temp_dir().join(format!("rustpilot-reasoning-events-{}", Uuid::new_v4()));
+    fs::create_dir_all(&directory).expect("test directory should be created");
+    let task = test_task("task-1");
+    let mut connection =
+        open_task_database(&task_database_path(&directory)).expect("task database should open");
+    let transaction = connection
+        .transaction()
+        .expect("event transaction should begin");
+    insert_task_state(&transaction, &task).expect("task snapshot should insert");
+    insert_stream_event(
+        &transaction,
+        "task-1",
+        "task-1-message",
+        &PersistedStreamEvent::ReasoningDelta {
+            delta: "thinking".to_string(),
+        },
+    )
+    .expect("reasoning event should insert");
+    insert_stream_event(
+        &transaction,
+        "task-1",
+        "task-1-message",
+        &PersistedStreamEvent::ReasoningOpaque {
+            value: "copilot-signature".to_string(),
+        },
+    )
+    .expect("opaque event should insert");
+    insert_stream_event(
+        &transaction,
+        "task-1",
+        "task-1-message",
+        &PersistedStreamEvent::TextDelta {
+            delta: "answer".to_string(),
+        },
+    )
+    .expect("text event should insert");
+    transaction
+        .commit()
+        .expect("event transaction should commit");
+    drop(connection);
+
+    let loaded = load_task_store(&directory).expect("stream events should replay");
+    let message = &loaded.tasks["task-1"].messages[0];
+    assert_eq!(message.reasoning, "thinking");
+    assert_eq!(
+        message.reasoning_opaque.as_deref(),
+        Some("copilot-signature")
+    );
+    assert_eq!(message.content, "answer");
+    assert!(matches!(message.parts[0], AssistantPart::Reasoning { .. }));
+    assert!(matches!(message.parts[1], AssistantPart::Text { .. }));
 
     let _ = fs::remove_dir_all(directory);
 }
@@ -477,6 +537,59 @@ fn tool_snapshot_order_and_hash_are_stable() {
 }
 
 #[test]
+fn agent_tool_snapshots_enforce_allowlists_and_dynamic_mcp_capabilities() {
+    let state = AppState::new();
+    mcp_tool::register_tools(
+        &state,
+        "demo",
+        &json!({
+            "result": {
+                "tools": [{
+                    "name": "read_rows",
+                    "description": "Read rows",
+                    "inputSchema": {"type": "object"}
+                }]
+            }
+        }),
+    )
+    .expect("MCP tools should register");
+
+    let browser = agents::AgentSpec::for_kind(agent::AgentKind::Browser, ".");
+    let browser_snapshot = tool_definitions_for_agent(&state, &browser);
+    let browser_names = browser_snapshot
+        .definitions
+        .iter()
+        .filter_map(|definition| definition.pointer("/function/name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(browser_names, vec!["rust_browser_use", "rust_terminate"]);
+    assert!(!browser.allows_tool("rust_mcp"));
+    assert!(!browser.allows_tool("rust_mcp_demo_read_rows"));
+    assert!(!browser.allows_tool("rust_sandbox_shell"));
+    assert!(browser.allows_tool("rust_terminate"));
+    assert!(!agent_has_tool(&state, &browser, "rust_mcp_demo_read_rows"));
+
+    let mcp = agents::AgentSpec::for_kind(agent::AgentKind::Mcp, ".");
+    let mcp_snapshot = tool_definitions_for_agent(&state, &mcp);
+    let mcp_names = mcp_snapshot
+        .definitions
+        .iter()
+        .filter_map(|definition| definition.pointer("/function/name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mcp_names,
+        vec!["rust_mcp", "rust_mcp_demo_read_rows", "rust_terminate"]
+    );
+    assert!(mcp.allows_tool("rust_mcp_demo_read_rows"));
+    assert!(agent_has_tool(&state, &mcp, "rust_mcp_demo_read_rows"));
+    assert!(!agent_has_tool(&state, &mcp, "rust_mcp_demo_missing"));
+    assert_eq!(
+        mcp_snapshot.schema_hash.as_ref(),
+        tool_schema_hash(mcp_snapshot.definitions.as_ref())
+    );
+    assert_ne!(browser_snapshot.schema_hash, mcp_snapshot.schema_hash);
+}
+
+#[test]
 fn identical_mcp_refresh_does_not_invalidate_tool_snapshot() {
     let state = AppState::new();
     let response = json!({
@@ -640,6 +753,8 @@ fn assistant_parts_keep_text_and_tool_order_with_unicode_offsets() {
         task_id: "task-1".to_string(),
         role: "assistant".to_string(),
         content: String::new(),
+        reasoning: String::new(),
+        reasoning_opaque: None,
         created_at: 1,
         streaming: true,
         parts: Vec::new(),
@@ -690,6 +805,97 @@ fn assistant_parts_keep_text_and_tool_order_with_unicode_offsets() {
             ..
         }
     ));
+}
+
+#[test]
+fn assistant_parts_keep_reasoning_before_text() {
+    let mut message = TaskMessage {
+        id: "assistant-reasoning".to_string(),
+        task_id: "task-1".to_string(),
+        role: "assistant".to_string(),
+        content: String::new(),
+        reasoning: String::new(),
+        reasoning_opaque: None,
+        created_at: 1,
+        streaming: true,
+        parts: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        name: None,
+        base64_image: None,
+        attachments: Vec::new(),
+    };
+    apply_stream_event(
+        &mut message,
+        &llm::StreamEvent::ReasoningDelta("思考".to_string()),
+    );
+    apply_stream_event(
+        &mut message,
+        &llm::StreamEvent::TextDelta("答案".to_string()),
+    );
+    assert_eq!(message.reasoning, "思考");
+    assert_eq!(message.content, "答案");
+    assert!(matches!(
+        message.parts[0],
+        AssistantPart::Reasoning {
+            start: 0,
+            end: 2,
+            ..
+        }
+    ));
+    assert!(matches!(
+        message.parts[1],
+        AssistantPart::Text {
+            start: 0,
+            end: 2,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn reasoning_is_forwarded_in_assistant_context() {
+    let entries = vec![AgentMemoryEntry {
+        id: "assistant-reasoning".to_string(),
+        role: "assistant".to_string(),
+        content: "answer".to_string(),
+        reasoning: "thinking".to_string(),
+        reasoning_opaque: None,
+        created_at: 1,
+        tool_call_id: None,
+        tool_names: Vec::new(),
+        tool_calls: Vec::new(),
+        name: None,
+        base64_image: None,
+        attachments: Vec::new(),
+    }];
+    let messages = memory_to_chat_messages(&entries);
+    assert_eq!(messages[0].reasoning_content.as_deref(), Some("thinking"));
+    let value = serde_json::to_value(&messages[0]).expect("chat message should serialize");
+    assert_eq!(value["reasoning_content"], "thinking");
+}
+
+#[test]
+fn reasoning_opaque_is_forwarded_without_becoming_visible_content() {
+    let entries = vec![AgentMemoryEntry {
+        id: "assistant-copilot".to_string(),
+        role: "assistant".to_string(),
+        content: String::new(),
+        reasoning: "thinking".to_string(),
+        reasoning_opaque: Some("signature".to_string()),
+        created_at: 1,
+        tool_call_id: None,
+        tool_names: Vec::new(),
+        tool_calls: Vec::new(),
+        name: None,
+        base64_image: None,
+        attachments: Vec::new(),
+    }];
+    let messages = memory_to_chat_messages(&entries);
+    assert_eq!(messages[0].reasoning_opaque.as_deref(), Some("signature"));
+    assert!(messages[0].content.is_none());
+    let value = serde_json::to_value(&messages[0]).expect("chat message should serialize");
+    assert_eq!(value["reasoning_opaque"], "signature");
 }
 
 #[test]
@@ -785,6 +991,8 @@ fn context_repairs_legacy_ui_tool_ids_to_model_ids() {
             id: "assistant-1".to_string(),
             role: "assistant".to_string(),
             content: String::new(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at: 1,
             tool_call_id: None,
             tool_names: vec!["rust_clock".to_string()],
@@ -797,6 +1005,8 @@ fn context_repairs_legacy_ui_tool_ids_to_model_ids() {
             id: "tool-1".to_string(),
             role: "tool".to_string(),
             content: "12:00".to_string(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at: 2,
             tool_call_id: Some("tool-ui-1".to_string()),
             tool_names: vec!["rust_clock".to_string()],
@@ -823,6 +1033,8 @@ fn context_inserts_a_truthful_result_for_an_interrupted_tool_call() {
             id: "assistant-1".to_string(),
             role: "assistant".to_string(),
             content: String::new(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at: 1,
             tool_call_id: None,
             tool_names: Vec::new(),
@@ -842,6 +1054,8 @@ fn context_inserts_a_truthful_result_for_an_interrupted_tool_call() {
             id: "user-2".to_string(),
             role: "user".to_string(),
             content: "缁х画".to_string(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at: 2,
             tool_call_id: None,
             tool_names: Vec::new(),
@@ -869,6 +1083,8 @@ fn context_budget_keeps_assistant_and_tool_messages_together() {
             id: "old-user".to_string(),
             role: "user".to_string(),
             content: "old".to_string(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at: 1,
             tool_call_id: None,
             tool_names: Vec::new(),
@@ -881,6 +1097,8 @@ fn context_budget_keeps_assistant_and_tool_messages_together() {
             id: "old-assistant".to_string(),
             role: "assistant".to_string(),
             content: "done".to_string(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at: 2,
             tool_call_id: None,
             tool_names: Vec::new(),
@@ -893,6 +1111,8 @@ fn context_budget_keeps_assistant_and_tool_messages_together() {
             id: "new-user".to_string(),
             role: "user".to_string(),
             content: "new".to_string(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at: 3,
             tool_call_id: None,
             tool_names: Vec::new(),
@@ -905,6 +1125,8 @@ fn context_budget_keeps_assistant_and_tool_messages_together() {
             id: "new-assistant".to_string(),
             role: "assistant".to_string(),
             content: String::new(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at: 4,
             tool_call_id: None,
             tool_names: Vec::new(),
@@ -924,6 +1146,8 @@ fn context_budget_keeps_assistant_and_tool_messages_together() {
             id: "new-tool".to_string(),
             role: "tool".to_string(),
             content: "now".to_string(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             created_at: 5,
             tool_call_id: Some("call-new".to_string()),
             tool_names: vec!["rust_clock".to_string()],

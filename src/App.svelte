@@ -299,6 +299,8 @@
       task_id: taskId,
       role: "assistant",
       content: "",
+      reasoning: "",
+      reasoning_opaque: null,
       created_at: Date.now(),
       streaming: true,
       parts: [],
@@ -316,6 +318,29 @@
       streaming: true,
       parts: [...(message.parts ?? [])]
     };
+    if (event.kind === "reasoning_delta" && event.delta) {
+      const parts = next.parts ?? [];
+      const last = parts[parts.length - 1];
+      const start = last?.type === "reasoning" ? last.end : (next.reasoning ?? "").length;
+      const end = start + event.delta.length;
+      next.reasoning = (next.reasoning ?? "") + event.delta;
+      if (last?.type === "reasoning" && last.end === start) {
+        parts[parts.length - 1] = { ...last, end };
+      } else {
+        parts.push({
+          type: "reasoning",
+          id: `${next.id}:reasoning:${start}`,
+          start,
+          end
+        });
+      }
+      next.parts = parts;
+      return next;
+    }
+    if (event.kind === "reasoning_opaque" && event.value) {
+      next.reasoning_opaque = event.value;
+      return next;
+    }
     if (event.kind === "text_delta" && event.delta) {
       const parts = next.parts ?? [];
       const last = parts[parts.length - 1];
@@ -658,8 +683,10 @@
     actionError = "";
     try {
       const task = await retryTask(selectedTask.id);
-      setSelectedTask(task);
-      await syncTask(task.id);
+      // `retry_task` returns the authoritative reset state. The persistence
+      // writer coalesces snapshots asynchronously, so an immediate database
+      // sync can otherwise replace it with the pre-retry task.
+      setSelectedTask(task, true);
     } catch (error) {
       actionError = error instanceof Error ? error.message : String(error);
     }

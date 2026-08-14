@@ -132,7 +132,13 @@ impl ReActAgentRuntime {
             .await?;
         let calls = response.tool_calls.clone();
         let content = (!response.content.is_empty()).then_some(response.content);
-        Ok(self.tool_agent.set_response(content, calls))
+        let reasoning = (!response.reasoning.is_empty()).then_some(response.reasoning);
+        Ok(self.tool_agent.set_response_with_reasoning_metadata(
+            content,
+            reasoning,
+            response.reasoning_opaque,
+            calls,
+        ))
     }
 
     pub async fn act(&mut self, cancel: &CancellationToken) -> Result<String, ReActError> {

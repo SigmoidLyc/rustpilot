@@ -69,6 +69,10 @@ pub struct AgentMemoryEntry {
     pub id: String,
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_opaque: Option<String>,
     pub created_at: i64,
     #[serde(default)]
     pub tool_call_id: Option<String>,
@@ -141,6 +145,11 @@ pub(crate) struct PersistentShell {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssistantPart {
+    Reasoning {
+        id: String,
+        start: usize,
+        end: usize,
+    },
     Text {
         id: String,
         start: usize,
@@ -160,6 +169,10 @@ pub struct TaskMessage {
     pub task_id: String,
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_opaque: Option<String>,
     pub created_at: i64,
     pub streaming: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

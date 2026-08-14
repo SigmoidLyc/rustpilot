@@ -12,6 +12,8 @@
     system: "System",
     tool: "Tool result"
   };
+
+  $: hasStreamingOutput = message.content.trim().length > 0 || message.tool_calls.length > 0;
 </script>
 
 <article class="message message-{message.role}">
@@ -29,8 +31,8 @@
   <div class="message-body">
     <div class="message-meta">
       <span>{roleLabels[message.role]}</span>
-      {#if message.streaming}
-        <span class="streaming-label">working</span>
+      {#if message.streaming && message.role === "assistant" && !hasStreamingOutput}
+        <span class="streaming-label">{message.reasoning?.trim() ? "thinking" : "planning"}</span>
       {/if}
     </div>
     <MessageAttachments taskId={message.task_id} attachments={message.attachments ?? []} />

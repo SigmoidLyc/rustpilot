@@ -18,13 +18,25 @@
 
   $: entries = conversationEntries(task);
   $: assistantMessages = task
-    ? task.messages.filter((message) => message.role === "assistant" && isVisibleAssistantMessage(message))
+    ? task.messages.filter(
+        (message) => message.role === "assistant" && isVisibleAssistantMessage(message, task)
+      )
     : [];
   $: hasToolCallMessage = assistantMessages.some((message) => message.tool_calls.length > 0);
 
-  function isVisibleAssistantMessage(message: TaskMessage): boolean {
+  function isTaskBusy(currentTask: Task | null): boolean {
+    return (
+      currentTask !== null &&
+      ["planning", "executing", "verifying", "waiting_approval"].includes(currentTask.status)
+    );
+  }
+
+  function isVisibleAssistantMessage(message: TaskMessage, currentTask: Task | null): boolean {
     if (message.tool_calls.length > 0) return true;
+    if (message.streaming) return true;
+    if (message.reasoning?.trim() && isTaskBusy(currentTask)) return true;
     const content = message.content.trim().toLowerCase();
+    if (!content) return false;
     return !content.startsWith("demo mode is active") && !content.startsWith("i will inspect");
   }
 
@@ -48,7 +60,7 @@
       if (message.role === "user") {
         flushAssistantTurn();
         grouped.push({ id: message.id, kind: "user", message });
-      } else if (message.role === "assistant" && isVisibleAssistantMessage(message)) {
+      } else if (message.role === "assistant" && isVisibleAssistantMessage(message, currentTask)) {
         pendingAssistantMessages = [...pendingAssistantMessages, message];
       }
     }

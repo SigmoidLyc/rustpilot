@@ -31,6 +31,15 @@ pub const MULTIMODAL_MODELS: &[&str] = &[
 const LLM_MAX_ATTEMPTS: usize = 3;
 const LLM_RETRY_DELAY_SECS: u64 = 5;
 const MAX_PROVIDER_DETAIL_CHARS: usize = 4096;
+const DEEPSEEK_V4_DEFAULT_MAX_TOKENS: u32 = 32_000;
+const FINAL_ANSWER_RECOVERY_PROMPT: &str =
+    "The previous response ended before it produced a final answer or tool call. Complete the immediately preceding task now. Output only the concise user-facing answer, a valid tool call, or the requested structured format; do not discuss this recovery instruction.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestMode {
+    Normal,
+    FinalAnswerRecovery,
+}
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -242,6 +251,10 @@ impl From<serde_json::Error> for LlmError {
 pub struct Completion {
     pub content: String,
     #[serde(default)]
+    pub reasoning: String,
+    #[serde(default)]
+    pub reasoning_opaque: Option<String>,
+    #[serde(default)]
     pub tool_calls: Vec<MessageToolCall>,
     #[serde(default)]
     pub prompt_tokens: Option<usize>,
@@ -268,6 +281,8 @@ impl Completion {
 /// text and tool input in the same order without changing model behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
+    ReasoningDelta(String),
+    ReasoningOpaque(String),
     TextDelta(String),
     ToolCallDelta {
         index: usize,
@@ -280,25 +295,62 @@ pub enum StreamEvent {
 struct StreamAttemptError {
     error: LlmError,
     output_started: bool,
+    completion: Completion,
 }
 
 fn stream_attempt_error(error: LlmError, completion: &Completion) -> StreamAttemptError {
     StreamAttemptError {
         error,
         output_started: completion_has_output(completion),
+        completion: completion.clone(),
     }
 }
 
+fn is_missing_final_output_error(error: &LlmError) -> bool {
+    matches!(
+        error,
+        LlmError::EmptyResponse { details }
+            if details.contains("no final answer")
+                || details.contains("did not produce a final answer")
+    )
+}
+
+fn should_recover_empty_stream(failure: &StreamAttemptError) -> bool {
+    completion_has_output(&failure.completion)
+        && !completion_has_final_output(&failure.completion)
+        && is_missing_final_output_error(&failure.error)
+}
+
+fn recovery_messages(messages: &[Value]) -> Vec<Value> {
+    // An incomplete reasoning-only response is not a valid Chat Completions
+    // assistant turn. In particular, DeepSeek rejects it even when
+    // `reasoning_content` is present, so restart from the valid history.
+    messages.to_vec()
+}
+
 fn completion_has_output(completion: &Completion) -> bool {
+    !completion.content.trim().is_empty()
+        || !completion.reasoning.trim().is_empty()
+        || completion.has_tool_calls()
+}
+
+fn completion_has_final_output(completion: &Completion) -> bool {
     !completion.content.trim().is_empty() || completion.has_tool_calls()
 }
 
 fn empty_completion_error(completion: &Completion) -> LlmError {
     let finish_reason = completion.finish_reason.as_deref().unwrap_or("unknown");
+    let details = if !completion.reasoning.trim().is_empty() {
+        if finish_reason == "length" {
+            "The provider exhausted its output budget during reasoning and did not produce a final answer. Increase the model output limit or lower its reasoning effort."
+        } else {
+            "The provider returned reasoning but no final answer or tool call."
+        }
+    } else {
+        "The provider returned no content or tool calls."
+    };
     LlmError::EmptyResponse {
-        details: format!(
-            "The provider returned no content or tool calls (finish_reason: {finish_reason})."
-        ),
+        details: format!("{details} (finish_reason: {finish_reason})."),
     }
 }
 
@@ -489,6 +541,13 @@ impl TokenCounter {
                     if let Some(content) = message.get("content") {
                         tokens += Self::count_content(content);
                     }
+                    tokens += Self::count_text(
+                        message
+                            .get("reasoning_content")
+                            .and_then(Value::as_str)
+                            .or_else(|| message.get("reasoning_text").and_then(Value::as_str))
+                            .unwrap_or(""),
+                    );
                     if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
                         tokens += Self::count_tool_calls(tool_calls);
                     }
@@ -859,6 +918,14 @@ impl OpenAiCompatibleClient {
         messages: &[Message],
         supports_images: bool,
     ) -> Result<Vec<Value>, LlmError> {
+        Self::format_messages_with_reasoning(messages, supports_images, false)
+    }
+
+    pub fn format_messages_with_reasoning(
+        messages: &[Message],
+        supports_images: bool,
+        copilot_reasoning: bool,
+    ) -> Result<Vec<Value>, LlmError> {
         let mut formatted = Vec::new();
         for message in messages {
             let mut value = message.to_dict();
@@ -882,11 +949,47 @@ impl OpenAiCompatibleClient {
             if !matches!(role, "system" | "user" | "assistant" | "tool") {
                 return Err(LlmError::InvalidInput(format!("Invalid role: {role}")));
             }
-            if value.get("content").is_some() || value.get("tool_calls").is_some() {
+            let has_content = value.get("content").is_some();
+            let has_reasoning = value.get("reasoning_content").is_some()
+                || value.get("reasoning_text").is_some()
+                || value.get("reasoning_opaque").is_some();
+            let has_tool_calls = value.get("tool_calls").is_some();
+            if has_content || has_reasoning || has_tool_calls {
                 formatted.push(value);
             }
         }
+        sanitize_openai_messages(&mut formatted, copilot_reasoning);
         Ok(formatted)
+    }
+
+    fn format_messages_for_provider(
+        &self,
+        messages: &[Message],
+        supports_images: bool,
+    ) -> Result<Vec<Value>, LlmError> {
+        let mut formatted = Self::format_messages_with_reasoning(
+            messages,
+            supports_images,
+            self.uses_copilot_reasoning(),
+        )?;
+        if self.uses_strict_assistant_history() {
+            sanitize_openai_messages_for_provider(
+                &mut formatted,
+                self.uses_copilot_reasoning(),
+                true,
+            );
+        }
+        Ok(formatted)
+    }
+
+    pub fn uses_copilot_reasoning(&self) -> bool {
+        provider_for_settings(&self.settings) == CacheProvider::Copilot
+    }
+
+    pub fn uses_strict_assistant_history(&self) -> bool {
+        let model = self.settings.model.to_ascii_lowercase();
+        let base_url = self.settings.base_url.to_ascii_lowercase();
+        model.contains("deepseek") || base_url.contains("deepseek")
     }
 
     pub fn check_token_limit(&self, input_tokens: usize) -> Result<(), LlmError> {
@@ -918,9 +1021,10 @@ impl OpenAiCompatibleClient {
     pub fn record_completion_usage(&self, completion: &Completion, fallback_input: usize) {
         self.record_usage(
             completion.prompt_tokens.unwrap_or(fallback_input),
-            completion
-                .completion_tokens
-                .unwrap_or_else(|| TokenCounter::count_text(&completion.content)),
+            completion.completion_tokens.unwrap_or_else(|| {
+                TokenCounter::count_text(&completion.content)
+                    + TokenCounter::count_text(&completion.reasoning)
+            }),
             completion.cached_input_tokens,
             completion.cache_write_tokens,
         );
@@ -936,7 +1040,7 @@ impl OpenAiCompatibleClient {
     ) -> Result<String, LlmError> {
         let mut all = system_messages.to_vec();
         all.extend_from_slice(messages);
-        let formatted = Self::format_messages(&all, self.supports_images())?;
+        let formatted = self.format_messages_for_provider(&all, self.supports_images())?;
         let input_tokens = TokenCounter::count_messages(&formatted);
         self.check_token_limit(input_tokens)?;
         let completion = if stream {
@@ -1007,6 +1111,11 @@ impl OpenAiCompatibleClient {
             .collect::<Vec<_>>();
         all.extend(messages[..messages.len() - 1].iter().map(Message::to_dict));
         all.push(value);
+        sanitize_openai_messages_for_provider(
+            &mut all,
+            self.uses_copilot_reasoning(),
+            self.uses_strict_assistant_history(),
+        );
         let input_tokens = TokenCounter::count_messages(&all);
         self.check_token_limit(input_tokens)?;
         let completion = if stream {
@@ -1033,7 +1142,7 @@ impl OpenAiCompatibleClient {
     ) -> Result<Completion, LlmError> {
         let mut all = system_messages.to_vec();
         all.extend_from_slice(messages);
-        let formatted = Self::format_messages(&all, self.supports_images())?;
+        let formatted = self.format_messages_for_provider(&all, self.supports_images())?;
         let input_tokens = TokenCounter::count_messages(&formatted)
             + tools
                 .iter()
@@ -1054,61 +1163,140 @@ impl OpenAiCompatibleClient {
         temperature: Option<f32>,
         cancel: &CancellationToken,
     ) -> Result<Completion, LlmError> {
-        for attempt in 0..LLM_MAX_ATTEMPTS {
-            let body = self.request_body(messages, tools, tool_choice, temperature, false);
-            let result = match self
-                .send_with_extension_fallback(
-                    body,
-                    || {
-                        self.request_body_without_extensions(
-                            messages,
-                            tools,
-                            tool_choice,
-                            temperature,
-                            false,
-                        )
-                    },
-                    cancel,
-                )
-                .await
-            {
-                Err(error) => Err(error),
-                Ok(response) if !response.status().is_success() => {
-                    Err(response_error(response).await)
-                }
-                Ok(response) => response
-                    .json::<Value>()
-                    .await
-                    .map_err(LlmError::Http)
-                    .and_then(|payload| {
-                        let completion = completion_from_response(&payload)?;
-                        if completion_has_output(&completion) {
-                            Ok(completion)
-                        } else {
-                            Err(empty_completion_error(&completion))
-                        }
-                    }),
-            };
+        self.complete_with_mode(
+            messages,
+            tools,
+            tool_choice,
+            temperature,
+            cancel,
+            RequestMode::Normal,
+        )
+        .await
+    }
 
-            match result {
-                Ok(completion) => {
-                    self.record_completion_usage(
-                        &completion,
-                        TokenCounter::count_messages(messages)
-                            + tools
-                                .iter()
-                                .map(|tool| TokenCounter::count_text(&tool.to_string()))
-                                .sum::<usize>(),
-                    );
-                    return Ok(completion);
+    pub async fn complete_final_answer_recovery(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        tool_choice: ToolChoice,
+        temperature: Option<f32>,
+        cancel: &CancellationToken,
+    ) -> Result<Completion, LlmError> {
+        self.complete_with_mode(
+            messages,
+            tools,
+            tool_choice,
+            temperature,
+            cancel,
+            RequestMode::FinalAnswerRecovery,
+        )
+        .await
+    }
+
+    async fn complete_with_mode(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        tool_choice: ToolChoice,
+        temperature: Option<f32>,
+        cancel: &CancellationToken,
+        mode: RequestMode,
+    ) -> Result<Completion, LlmError> {
+        let mut request_messages = messages.to_vec();
+        let mut request_mode = mode;
+        let mut recovered_reasoning = String::new();
+        let mut recovered_reasoning_opaque = None;
+        'mode: loop {
+            let max_attempts = match request_mode {
+                RequestMode::Normal => LLM_MAX_ATTEMPTS,
+                RequestMode::FinalAnswerRecovery => 1,
+            };
+            for attempt in 0..max_attempts {
+                let body = self.request_body_for_mode(
+                    &request_messages,
+                    tools,
+                    tool_choice,
+                    temperature,
+                    false,
+                    request_mode,
+                );
+                let mut incomplete_completion = None;
+                let result = match self
+                    .send_with_extension_fallback(
+                        body,
+                        || {
+                            self.request_body_without_extensions_for_mode(
+                                &request_messages,
+                                tools,
+                                tool_choice,
+                                temperature,
+                                false,
+                                request_mode,
+                            )
+                        },
+                        cancel,
+                    )
+                    .await
+                {
+                    Err(error) => Err(error),
+                    Ok(response) if !response.status().is_success() => {
+                        Err(response_error(response).await)
+                    }
+                    Ok(response) => response
+                        .json::<Value>()
+                        .await
+                        .map_err(LlmError::Http)
+                        .and_then(|payload| {
+                            let completion = completion_from_response(&payload)?;
+                            if completion_has_final_output(&completion) {
+                                Ok(completion)
+                            } else {
+                                incomplete_completion = Some(completion.clone());
+                                Err(empty_completion_error(&completion))
+                            }
+                        }),
+                };
+
+                match result {
+                    Ok(mut completion) => {
+                        if !recovered_reasoning.is_empty() {
+                            recovered_reasoning.push_str(&completion.reasoning);
+                            completion.reasoning = std::mem::take(&mut recovered_reasoning);
+                        }
+                        if completion.reasoning_opaque.is_none() {
+                            completion.reasoning_opaque = recovered_reasoning_opaque.take();
+                        }
+                        self.record_completion_usage(
+                            &completion,
+                            TokenCounter::count_messages(&request_messages)
+                                + tools
+                                    .iter()
+                                    .map(|tool| TokenCounter::count_text(&tool.to_string()))
+                                    .sum::<usize>(),
+                        );
+                        return Ok(completion);
+                    }
+                    Err(error)
+                        if request_mode == RequestMode::Normal
+                            && is_missing_final_output_error(&error) =>
+                    {
+                        request_messages = recovery_messages(&request_messages);
+                        if let Some(completion) = incomplete_completion.as_ref() {
+                            recovered_reasoning.push_str(&completion.reasoning);
+                            if recovered_reasoning_opaque.is_none() {
+                                recovered_reasoning_opaque = completion.reasoning_opaque.clone();
+                            }
+                        }
+                        request_mode = RequestMode::FinalAnswerRecovery;
+                        continue 'mode;
+                    }
+                    Err(error) if attempt + 1 < max_attempts && is_retryable_error(&error) => {
+                        wait_for_retry(attempt, &error, cancel).await?;
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) if attempt + 1 < LLM_MAX_ATTEMPTS && is_retryable_error(&error) => {
-                    wait_for_retry(attempt, &error, cancel).await?;
-                }
-                Err(error) => return Err(error),
             }
         }
-        unreachable!("LLM retry loop must return within its attempt limit")
     }
 
     pub async fn complete_with_response_format(
@@ -1117,64 +1305,120 @@ impl OpenAiCompatibleClient {
         response_format: Option<Value>,
         cancel: &CancellationToken,
     ) -> Result<Completion, LlmError> {
-        for attempt in 0..LLM_MAX_ATTEMPTS {
-            let mut body = self.request_body(messages, &[], ToolChoice::None, None, false);
-            if let Some(response_format) = response_format.clone() {
-                body["response_format"] = response_format;
-            }
-            let result = match self
-                .send_with_extension_fallback(
-                    body,
-                    || {
-                        let mut fallback = self.request_body_without_extensions(
-                            messages,
-                            &[],
-                            ToolChoice::None,
-                            None,
-                            false,
-                        );
-                        if let Some(response_format) = response_format.clone() {
-                            fallback["response_format"] = response_format;
-                        }
-                        fallback
-                    },
-                    cancel,
-                )
-                .await
-            {
-                Err(error) => Err(error),
-                Ok(response) if !response.status().is_success() => {
-                    Err(response_error(response).await)
-                }
-                Ok(response) => response
-                    .json::<Value>()
-                    .await
-                    .map_err(LlmError::Http)
-                    .and_then(|payload| {
-                        let completion = completion_from_response(&payload)?;
-                        if completion_has_output(&completion) {
-                            Ok(completion)
-                        } else {
-                            Err(empty_completion_error(&completion))
-                        }
-                    }),
-            };
+        self.complete_with_response_format_mode(
+            messages,
+            response_format,
+            cancel,
+            RequestMode::Normal,
+        )
+        .await
+    }
 
-            match result {
-                Ok(completion) => {
-                    self.record_completion_usage(
-                        &completion,
-                        TokenCounter::count_messages(messages),
-                    );
-                    return Ok(completion);
+    async fn complete_with_response_format_mode(
+        &self,
+        messages: &[Value],
+        response_format: Option<Value>,
+        cancel: &CancellationToken,
+        mode: RequestMode,
+    ) -> Result<Completion, LlmError> {
+        let mut request_messages = messages.to_vec();
+        let mut request_mode = mode;
+        let mut recovered_reasoning = String::new();
+        let mut recovered_reasoning_opaque = None;
+        'mode: loop {
+            let max_attempts = match request_mode {
+                RequestMode::Normal => LLM_MAX_ATTEMPTS,
+                RequestMode::FinalAnswerRecovery => 1,
+            };
+            for attempt in 0..max_attempts {
+                let mut body = self.request_body_for_mode(
+                    &request_messages,
+                    &[],
+                    ToolChoice::None,
+                    None,
+                    false,
+                    request_mode,
+                );
+                if let Some(response_format) = response_format.clone() {
+                    body["response_format"] = response_format;
                 }
-                Err(error) if attempt + 1 < LLM_MAX_ATTEMPTS && is_retryable_error(&error) => {
-                    wait_for_retry(attempt, &error, cancel).await?;
+                let mut incomplete_completion = None;
+                let result = match self
+                    .send_with_extension_fallback(
+                        body,
+                        || {
+                            let mut fallback = self.request_body_without_extensions_for_mode(
+                                &request_messages,
+                                &[],
+                                ToolChoice::None,
+                                None,
+                                false,
+                                request_mode,
+                            );
+                            if let Some(response_format) = response_format.clone() {
+                                fallback["response_format"] = response_format;
+                            }
+                            fallback
+                        },
+                        cancel,
+                    )
+                    .await
+                {
+                    Err(error) => Err(error),
+                    Ok(response) if !response.status().is_success() => {
+                        Err(response_error(response).await)
+                    }
+                    Ok(response) => response
+                        .json::<Value>()
+                        .await
+                        .map_err(LlmError::Http)
+                        .and_then(|payload| {
+                            let completion = completion_from_response(&payload)?;
+                            if completion_has_final_output(&completion) {
+                                Ok(completion)
+                            } else {
+                                incomplete_completion = Some(completion.clone());
+                                Err(empty_completion_error(&completion))
+                            }
+                        }),
+                };
+
+                match result {
+                    Ok(mut completion) => {
+                        if !recovered_reasoning.is_empty() {
+                            recovered_reasoning.push_str(&completion.reasoning);
+                            completion.reasoning = std::mem::take(&mut recovered_reasoning);
+                        }
+                        if completion.reasoning_opaque.is_none() {
+                            completion.reasoning_opaque = recovered_reasoning_opaque.take();
+                        }
+                        self.record_completion_usage(
+                            &completion,
+                            TokenCounter::count_messages(&request_messages),
+                        );
+                        return Ok(completion);
+                    }
+                    Err(error)
+                        if request_mode == RequestMode::Normal
+                            && is_missing_final_output_error(&error) =>
+                    {
+                        request_messages = recovery_messages(&request_messages);
+                        if let Some(completion) = incomplete_completion.as_ref() {
+                            recovered_reasoning.push_str(&completion.reasoning);
+                            if recovered_reasoning_opaque.is_none() {
+                                recovered_reasoning_opaque = completion.reasoning_opaque.clone();
+                            }
+                        }
+                        request_mode = RequestMode::FinalAnswerRecovery;
+                        continue 'mode;
+                    }
+                    Err(error) if attempt + 1 < max_attempts && is_retryable_error(&error) => {
+                        wait_for_retry(attempt, &error, cancel).await?;
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             }
         }
-        unreachable!("LLM retry loop must return within its attempt limit")
     }
 
     pub async fn stream<F>(
@@ -1189,40 +1433,119 @@ impl OpenAiCompatibleClient {
     where
         F: FnMut(&StreamEvent) -> Result<(), LlmError>,
     {
-        for attempt in 0..LLM_MAX_ATTEMPTS {
-            match self
-                .stream_attempt(
-                    messages,
-                    tools,
-                    tool_choice,
-                    temperature,
-                    cancel,
-                    &mut on_event,
-                )
-                .await
-            {
-                Ok(completion) => {
-                    self.record_completion_usage(
-                        &completion,
-                        TokenCounter::count_messages(messages)
-                            + tools
-                                .iter()
-                                .map(|tool| TokenCounter::count_text(&tool.to_string()))
-                                .sum::<usize>(),
-                    );
-                    return Ok(completion);
-                }
-                Err(failure)
-                    if !failure.output_started
-                        && attempt + 1 < LLM_MAX_ATTEMPTS
-                        && is_retryable_error(&failure.error) =>
+        self.stream_with_mode(
+            messages,
+            tools,
+            tool_choice,
+            temperature,
+            cancel,
+            RequestMode::Normal,
+            &mut on_event,
+        )
+        .await
+    }
+
+    pub async fn stream_final_answer_recovery<F>(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        tool_choice: ToolChoice,
+        temperature: Option<f32>,
+        cancel: &CancellationToken,
+        mut on_event: F,
+    ) -> Result<Completion, LlmError>
+    where
+        F: FnMut(&StreamEvent) -> Result<(), LlmError>,
+    {
+        self.stream_with_mode(
+            messages,
+            tools,
+            tool_choice,
+            temperature,
+            cancel,
+            RequestMode::FinalAnswerRecovery,
+            &mut on_event,
+        )
+        .await
+    }
+
+    async fn stream_with_mode<F>(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        tool_choice: ToolChoice,
+        temperature: Option<f32>,
+        cancel: &CancellationToken,
+        mode: RequestMode,
+        on_event: &mut F,
+    ) -> Result<Completion, LlmError>
+    where
+        F: FnMut(&StreamEvent) -> Result<(), LlmError>,
+    {
+        let mut request_messages = messages.to_vec();
+        let mut request_mode = mode;
+        let mut recovered_reasoning = String::new();
+        let mut recovered_reasoning_opaque = None;
+        'mode: loop {
+            let max_attempts = match request_mode {
+                RequestMode::Normal => LLM_MAX_ATTEMPTS,
+                RequestMode::FinalAnswerRecovery => 1,
+            };
+            for attempt in 0..max_attempts {
+                match self
+                    .stream_attempt(
+                        &request_messages,
+                        tools,
+                        tool_choice,
+                        temperature,
+                        cancel,
+                        request_mode,
+                        on_event,
+                    )
+                    .await
                 {
-                    wait_for_retry(attempt, &failure.error, cancel).await?;
+                    Ok(mut completion) => {
+                        if !recovered_reasoning.is_empty() {
+                            recovered_reasoning.push_str(&completion.reasoning);
+                            completion.reasoning = std::mem::take(&mut recovered_reasoning);
+                        }
+                        if completion.reasoning_opaque.is_none() {
+                            completion.reasoning_opaque = recovered_reasoning_opaque.take();
+                        }
+                        self.record_completion_usage(
+                            &completion,
+                            TokenCounter::count_messages(&request_messages)
+                                + tools
+                                    .iter()
+                                    .map(|tool| TokenCounter::count_text(&tool.to_string()))
+                                    .sum::<usize>(),
+                        );
+                        return Ok(completion);
+                    }
+                    Err(failure)
+                        if request_mode == RequestMode::Normal
+                            && should_recover_empty_stream(&failure) =>
+                    {
+                        recovered_reasoning.push_str(&failure.completion.reasoning);
+                        if recovered_reasoning_opaque.is_none() {
+                            recovered_reasoning_opaque =
+                                failure.completion.reasoning_opaque.clone();
+                        }
+                        request_messages = recovery_messages(&request_messages);
+                        request_mode = RequestMode::FinalAnswerRecovery;
+                        continue 'mode;
+                    }
+                    Err(failure)
+                        if !failure.output_started
+                            && attempt + 1 < max_attempts
+                            && is_retryable_error(&failure.error) =>
+                    {
+                        wait_for_retry(attempt, &failure.error, cancel).await?;
+                    }
+                    Err(failure) => return Err(failure.error),
                 }
-                Err(failure) => return Err(failure.error),
             }
         }
-        unreachable!("LLM retry loop must return within its attempt limit")
     }
 
     async fn stream_attempt<F>(
@@ -1232,6 +1555,7 @@ impl OpenAiCompatibleClient {
         tool_choice: ToolChoice,
         temperature: Option<f32>,
         cancel: &CancellationToken,
+        mode: RequestMode,
         on_event: &mut F,
     ) -> Result<Completion, StreamAttemptError>
     where
@@ -1239,6 +1563,8 @@ impl OpenAiCompatibleClient {
     {
         let mut completion = Completion {
             content: String::new(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             tool_calls: Vec::new(),
             prompt_tokens: None,
             completion_tokens: None,
@@ -1246,17 +1572,19 @@ impl OpenAiCompatibleClient {
             cache_write_tokens: None,
             finish_reason: None,
         };
-        let body = self.request_body(messages, tools, tool_choice, temperature, true);
+        let body =
+            self.request_body_for_mode(messages, tools, tool_choice, temperature, true, mode);
         let response = self
             .send_with_extension_fallback(
                 body,
                 || {
-                    self.request_body_without_extensions(
+                    self.request_body_without_extensions_for_mode(
                         messages,
                         tools,
                         tool_choice,
                         temperature,
                         true,
+                        mode,
                     )
                 },
                 cancel,
@@ -1320,7 +1648,7 @@ impl OpenAiCompatibleClient {
                 return Err(stream_attempt_error(error, &completion));
             }
         }
-        if !completion_has_output(&completion) {
+        if !completion_has_final_output(&completion) {
             return Err(stream_attempt_error(
                 empty_completion_error(&completion),
                 &completion,
@@ -1329,6 +1657,7 @@ impl OpenAiCompatibleClient {
         Ok(completion)
     }
 
+    #[allow(dead_code)]
     fn request_body(
         &self,
         messages: &[Value],
@@ -1337,9 +1666,38 @@ impl OpenAiCompatibleClient {
         temperature: Option<f32>,
         stream: bool,
     ) -> Value {
-        self.request_body_with_extensions(messages, tools, tool_choice, temperature, stream, true)
+        self.request_body_for_mode(
+            messages,
+            tools,
+            tool_choice,
+            temperature,
+            stream,
+            RequestMode::Normal,
+        )
     }
 
+    fn request_body_for_mode(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        tool_choice: ToolChoice,
+        temperature: Option<f32>,
+        stream: bool,
+        mode: RequestMode,
+    ) -> Value {
+        self.request_body_with_extensions_for_mode(
+            messages,
+            tools,
+            tool_choice,
+            temperature,
+            stream,
+            true,
+            mode,
+        )
+    }
+
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     fn request_body_without_extensions(
         &self,
         messages: &[Value],
@@ -1348,9 +1706,38 @@ impl OpenAiCompatibleClient {
         temperature: Option<f32>,
         stream: bool,
     ) -> Value {
-        self.request_body_with_extensions(messages, tools, tool_choice, temperature, stream, false)
+        self.request_body_without_extensions_for_mode(
+            messages,
+            tools,
+            tool_choice,
+            temperature,
+            stream,
+            RequestMode::Normal,
+        )
     }
 
+    fn request_body_without_extensions_for_mode(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        tool_choice: ToolChoice,
+        temperature: Option<f32>,
+        stream: bool,
+        mode: RequestMode,
+    ) -> Value {
+        self.request_body_with_extensions_for_mode(
+            messages,
+            tools,
+            tool_choice,
+            temperature,
+            stream,
+            false,
+            mode,
+        )
+    }
+
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     fn request_body_with_extensions(
         &self,
         messages: &[Value],
@@ -1360,6 +1747,39 @@ impl OpenAiCompatibleClient {
         stream: bool,
         apply_extensions: bool,
     ) -> Value {
+        self.request_body_with_extensions_for_mode(
+            messages,
+            tools,
+            tool_choice,
+            temperature,
+            stream,
+            apply_extensions,
+            RequestMode::Normal,
+        )
+    }
+
+    fn request_body_with_extensions_for_mode(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        tool_choice: ToolChoice,
+        temperature: Option<f32>,
+        stream: bool,
+        apply_extensions: bool,
+        mode: RequestMode,
+    ) -> Value {
+        let mut messages = messages.to_vec();
+        if mode == RequestMode::FinalAnswerRecovery {
+            messages.push(json!({
+                "role": "user",
+                "content": FINAL_ANSWER_RECOVERY_PROMPT,
+            }));
+        }
+        sanitize_openai_messages_for_provider(
+            &mut messages,
+            self.uses_copilot_reasoning(),
+            self.uses_strict_assistant_history(),
+        );
         let mut body = json!({
             "model": self.settings.model,
             "messages": messages,
@@ -1369,16 +1789,31 @@ impl OpenAiCompatibleClient {
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
         }
+        let max_tokens = self.max_tokens_for_mode(mode);
         if REASONING_MODELS.contains(&self.settings.model.as_str()) {
-            body["max_completion_tokens"] = json!(self.settings.max_tokens);
+            body["max_completion_tokens"] = json!(max_tokens);
         } else {
-            body["max_tokens"] = json!(self.settings.max_tokens);
+            body["max_tokens"] = json!(max_tokens);
             body["temperature"] = json!(temperature.unwrap_or(self.settings.temperature));
         }
         if apply_extensions {
             self.apply_prompt_cache(&mut body, stream);
         }
         body
+    }
+
+    fn is_deepseek_v4(&self) -> bool {
+        let model = self.settings.model.to_ascii_lowercase();
+        let base_url = self.settings.base_url.to_ascii_lowercase();
+        (model.contains("deepseek-v4") || model.contains("deepseek/v4"))
+            || (base_url.contains("deepseek") && model.contains("v4"))
+    }
+
+    fn max_tokens_for_mode(&self, _mode: RequestMode) -> u32 {
+        if self.is_deepseek_v4() {
+            return DEEPSEEK_V4_DEFAULT_MAX_TOKENS;
+        }
+        self.settings.max_tokens.max(1)
     }
 
     fn apply_prompt_cache(&self, body: &mut Value, stream: bool) {
@@ -1596,13 +2031,14 @@ fn completion_from_response(payload: &Value) -> Result<Completion, LlmError> {
             ),
         })?;
     let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
-    let content = message
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let (content, content_reasoning) = parse_content_parts(message.get("content"));
     let mut completion = Completion {
         content,
+        reasoning: parse_reasoning_fields(&message)
+            .or(content_reasoning)
+            .unwrap_or_default(),
+        reasoning_opaque: parse_reasoning_opaque(&message)
+            .or_else(|| parse_reasoning_opaque(choice)),
         tool_calls: parse_tool_calls(message.get("tool_calls")),
         prompt_tokens: None,
         completion_tokens: None,
@@ -1617,6 +2053,208 @@ fn completion_from_response(payload: &Value) -> Result<Completion, LlmError> {
         apply_usage(&mut completion, usage);
     }
     Ok(completion)
+}
+
+fn parse_content_parts(value: Option<&Value>) -> (String, Option<String>) {
+    let Some(parts) = value.and_then(Value::as_array) else {
+        return (
+            value.and_then(Value::as_str).unwrap_or("").to_string(),
+            None,
+        );
+    };
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    for part in parts {
+        let kind = part.get("type").and_then(Value::as_str);
+        let text = part
+            .get("text")
+            .and_then(Value::as_str)
+            .or_else(|| part.get("thinking").and_then(Value::as_str))
+            .unwrap_or("");
+        if matches!(kind, Some("thinking" | "reasoning")) || part.get("thinking").is_some() {
+            reasoning.push_str(text);
+        } else {
+            content.push_str(text);
+        }
+    }
+    (content, (!reasoning.is_empty()).then_some(reasoning))
+}
+
+fn parse_reasoning(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str().filter(|text| !text.is_empty()) {
+        return Some(text.to_string());
+    }
+    if let Some(text) = value
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    if let Some(text) = value
+        .get("thinking")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    let parts = value.as_array()?;
+    let mut output = String::new();
+    for part in parts {
+        let text = part
+            .as_str()
+            .or_else(|| part.get("text").and_then(Value::as_str))
+            .or_else(|| part.get("thinking").and_then(Value::as_str));
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            output.push_str(text);
+        }
+    }
+    (!output.is_empty()).then_some(output)
+}
+
+fn parse_reasoning_fields(value: &Value) -> Option<String> {
+    [
+        "reasoning_content",
+        "reasoning_text",
+        "reasoning",
+        "thinking",
+    ]
+    .iter()
+    .find_map(|key| parse_reasoning(value.get(*key)))
+}
+
+fn parse_reasoning_opaque(value: &Value) -> Option<String> {
+    value
+        .get("reasoning_opaque")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+pub fn normalize_openai_reasoning_fields(value: &mut Value, copilot_reasoning: bool) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let opaque = object
+        .get("reasoning_opaque")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    if copilot_reasoning {
+        let reasoning = object
+            .get("reasoning_content")
+            .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+            .cloned()
+            .or_else(|| {
+                object
+                    .get("reasoning_text")
+                    .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+                    .cloned()
+            });
+        object.remove("reasoning_content");
+        object.remove("reasoning_text");
+        if opaque.is_some() {
+            if let Some(reasoning) =
+                reasoning.filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+            {
+                object.insert("reasoning_text".to_string(), reasoning);
+            }
+        } else {
+            object.remove("reasoning_opaque");
+        }
+    } else {
+        object.remove("reasoning_text");
+        object.remove("reasoning_opaque");
+    }
+}
+
+fn assistant_content_is_set(value: &Value) -> bool {
+    match value.get("content") {
+        Some(Value::String(content)) => !content.trim().is_empty(),
+        Some(Value::Array(parts)) => !parts.is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => true,
+    }
+}
+
+fn assistant_tool_calls_are_set(value: &Value) -> bool {
+    value
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty())
+}
+
+fn assistant_reasoning_is_set(value: &Value) -> bool {
+    ["reasoning_content", "reasoning_text"].iter().any(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+    })
+}
+
+/// Normalize assistant turns at the Chat Completions wire boundary. Compatible
+/// providers retain reasoning-only turns, while strict DeepSeek history keeps
+/// only assistant turns that contain actual content or tool calls.
+pub fn sanitize_openai_messages(messages: &mut Vec<Value>, copilot_reasoning: bool) {
+    sanitize_openai_messages_for_provider(messages, copilot_reasoning, false);
+}
+
+pub fn sanitize_openai_messages_for_provider(
+    messages: &mut Vec<Value>,
+    copilot_reasoning: bool,
+    strict_assistant_history: bool,
+) {
+    for message in messages.iter_mut() {
+        normalize_openai_reasoning_fields(message, copilot_reasoning);
+    }
+    messages.retain(|message| {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            return true;
+        }
+        let has_content = assistant_content_is_set(message);
+        let has_tool_calls = assistant_tool_calls_are_set(message);
+        let has_reasoning = assistant_reasoning_is_set(message);
+        if strict_assistant_history {
+            has_content || has_tool_calls
+        } else {
+            has_content || has_tool_calls || has_reasoning
+        }
+    });
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let has_content = assistant_content_is_set(message);
+        let has_tool_calls = assistant_tool_calls_are_set(message);
+        let has_reasoning = assistant_reasoning_is_set(message);
+        if !has_content && (has_tool_calls || has_reasoning) {
+            message["content"] = Value::Null;
+        }
+        if strict_assistant_history
+            && (has_content || has_tool_calls)
+            && !message
+                .get("reasoning_content")
+                .is_some_and(|value| value.is_string())
+            && !message
+                .get("reasoning_text")
+                .is_some_and(|value| value.is_string())
+        {
+            message["reasoning_content"] = Value::String(String::new());
+        }
+        if strict_assistant_history && message.get("reasoning_text").is_some() {
+            if let Some(reasoning) = message.get("reasoning_text").cloned() {
+                message["reasoning_content"] = reasoning;
+            }
+            if let Some(object) = message.as_object_mut() {
+                object.remove("reasoning_text");
+            }
+        }
+        if !has_content && !has_tool_calls && has_reasoning {
+            message["content"] = Value::Null;
+        }
+    }
 }
 
 fn usage_number(usage: &Value, paths: &[&str]) -> Option<usize> {
@@ -1747,6 +2385,27 @@ where
     {
         completion.finish_reason = Some(reason.to_string());
     }
+    if let Some(delta) = chunk.pointer("/choices/0/delta") {
+        if let Some(reasoning_opaque) = parse_reasoning_opaque(delta) {
+            match completion.reasoning_opaque.as_deref() {
+                Some(previous) if previous != reasoning_opaque => {
+                    return Err(LlmError::InvalidInput(
+                        "The provider returned multiple reasoning_opaque values in one response."
+                            .to_string(),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    completion.reasoning_opaque = Some(reasoning_opaque.clone());
+                    on_event(&StreamEvent::ReasoningOpaque(reasoning_opaque))?;
+                }
+            }
+        }
+        if let Some(reasoning) = parse_reasoning_fields(delta) {
+            completion.reasoning.push_str(&reasoning);
+            on_event(&StreamEvent::ReasoningDelta(reasoning))?;
+        }
+    }
     if let Some(content) = chunk
         .pointer("/choices/0/delta/content")
         .and_then(Value::as_str)
@@ -1803,6 +2462,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     #[test]
     fn token_counter_matches_image_rules() {
@@ -1826,6 +2490,359 @@ mod tests {
     }
 
     #[test]
+    fn message_formatting_keeps_reasoning_only_assistant_turns_for_compatible_providers() {
+        let mut message = Message::assistant(None);
+        message.reasoning_content = Some("thinking".to_string());
+        let formatted = OpenAiCompatibleClient::format_messages(&[message], false).unwrap();
+        assert_eq!(formatted[0]["reasoning_content"], "thinking");
+    }
+
+    #[test]
+    fn message_formatting_keeps_tool_calls_without_assistant_content() {
+        let message = Message::assistant_with_tools(
+            None,
+            vec![MessageToolCall {
+                id: "call-1".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "rust_clock".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }],
+        );
+        let formatted = OpenAiCompatibleClient::format_messages(&[message], false).unwrap();
+        assert_eq!(formatted.len(), 1);
+        assert_eq!(formatted[0]["content"], Value::Null);
+        assert_eq!(formatted[0]["tool_calls"][0]["id"], "call-1");
+    }
+
+    #[test]
+    fn copilot_reasoning_requires_opaque_and_uses_reasoning_text() {
+        let mut message = Message::assistant(None);
+        message.reasoning_content = Some("thinking".to_string());
+        message.reasoning_opaque = Some("signature".to_string());
+        let formatted =
+            OpenAiCompatibleClient::format_messages_with_reasoning(&[message], false, true)
+                .unwrap();
+        assert_eq!(formatted[0]["reasoning_text"], "thinking");
+        assert_eq!(formatted[0]["reasoning_opaque"], "signature");
+        assert!(formatted[0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn copilot_reasoning_without_opaque_is_not_sent() {
+        let mut message = Message::assistant(None);
+        message.reasoning_content = Some("thinking".to_string());
+        let formatted =
+            OpenAiCompatibleClient::format_messages_with_reasoning(&[message], false, true)
+                .unwrap();
+        assert!(formatted.is_empty());
+    }
+
+    #[test]
+    fn regular_provider_does_not_send_copilot_reasoning_fields() {
+        let mut message = Message::assistant(Some("answer".to_string()));
+        message.reasoning_content = Some("thinking".to_string());
+        message.reasoning_opaque = Some("signature".to_string());
+        let formatted = OpenAiCompatibleClient::format_messages(&[message], false).unwrap();
+        assert_eq!(formatted[0]["reasoning_content"], "thinking");
+        assert!(formatted[0].get("reasoning_text").is_none());
+        assert!(formatted[0].get("reasoning_opaque").is_none());
+    }
+
+    #[test]
+    fn strict_deepseek_history_drops_reasoning_only_assistant_turns() {
+        let tool_call = json!({
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "rust_clock", "arguments": "{}"}
+        });
+        let mut messages = vec![
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": null, "reasoning_content": "hidden"}),
+            json!({"role": "assistant", "content": "", "tool_calls": []}),
+            json!({"role": "assistant", "tool_calls": [tool_call]}),
+            json!({"role": "tool", "tool_call_id": "call-1", "content": "now"}),
+            json!({"role": "assistant", "content": "answer"}),
+        ];
+        sanitize_openai_messages_for_provider(&mut messages, false, true);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(messages[1]["reasoning_content"], "");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[3]["content"], "answer");
+    }
+
+    #[test]
+    fn request_body_sanitizes_messages_at_the_wire_boundary() {
+        let client = OpenAiCompatibleClient::new(LlmSettings {
+            api_key: "test".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            ..LlmSettings::default()
+        })
+        .unwrap();
+        let body = client.request_body(
+            &[
+                json!({"role": "user", "content": "question"}),
+                json!({"role": "assistant", "reasoning_content": "hidden"}),
+                json!({"role": "user", "content": "continue"}),
+            ],
+            &[],
+            ToolChoice::Auto,
+            None,
+            true,
+        );
+        assert_eq!(
+            body["messages"],
+            json!([
+                {"role": "user", "content": "question"},
+                {"role": "user", "content": "continue"}
+            ])
+        );
+    }
+
+    #[test]
+    fn request_body_preserves_reasoning_for_other_compatible_providers() {
+        let client = OpenAiCompatibleClient::new(LlmSettings {
+            api_key: "test".to_string(),
+            ..LlmSettings::default()
+        })
+        .unwrap();
+        let body = client.request_body(
+            &[json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "hidden"
+            })],
+            &[],
+            ToolChoice::Auto,
+            None,
+            true,
+        );
+        assert_eq!(body["messages"][0]["reasoning_content"], "hidden");
+    }
+
+    #[test]
+    fn deepseek_v4_keeps_default_thinking_and_sanitizes_recovery_history() {
+        let client = OpenAiCompatibleClient::new(LlmSettings {
+            api_key: "test".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            ..LlmSettings::default()
+        })
+        .unwrap();
+        let messages = vec![
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": null, "reasoning_content": "thinking"}),
+        ];
+        let normal = client.request_body_for_mode(
+            &messages,
+            &[],
+            ToolChoice::Auto,
+            None,
+            true,
+            RequestMode::Normal,
+        );
+        assert_eq!(normal["max_tokens"], 32_000);
+        assert!(normal.get("reasoning_effort").is_none());
+        assert_eq!(normal["messages"].as_array().unwrap().len(), 1);
+
+        let recovery = client.request_body_for_mode(
+            &recovery_messages(&messages),
+            &[],
+            ToolChoice::Auto,
+            None,
+            true,
+            RequestMode::FinalAnswerRecovery,
+        );
+        assert_eq!(recovery["max_tokens"], 32_000);
+        assert!(recovery.get("reasoning_effort").is_none());
+        assert!(recovery.get("thinking").is_none());
+        assert_eq!(recovery["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(recovery["messages"][1]["role"], "user");
+        assert_eq!(
+            recovery["messages"][1]["content"],
+            FINAL_ANSWER_RECOVERY_PROMPT
+        );
+    }
+
+    #[test]
+    fn recovery_history_does_not_append_an_incomplete_assistant_turn() {
+        let original = vec![json!({
+            "role": "user",
+            "content": "question"
+        })];
+        assert_eq!(recovery_messages(&original), original);
+    }
+
+    #[tokio::test]
+    async fn stream_recovers_reasoning_only_response_with_one_continuation_request() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response_body in [
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut headers = Vec::new();
+                loop {
+                    let mut byte = [0u8; 1];
+                    stream.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                    if headers.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let header_text = String::from_utf8_lossy(&headers);
+                let content_length = header_text
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .or_else(|| line.strip_prefix("Content-Length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap();
+                let mut body = vec![0u8; content_length];
+                stream.read_exact(&mut body).unwrap();
+                request.extend_from_slice(&body);
+                requests.push(serde_json::from_slice::<Value>(&request).unwrap());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+
+        let client = OpenAiCompatibleClient::new(LlmSettings {
+            api_key: "test".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            base_url: format!("http://{address}/v1"),
+            ..LlmSettings::default()
+        })
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let mut events = Vec::new();
+        let completion = client
+            .stream(
+                &[json!({"role": "user", "content": "question"})],
+                &[],
+                ToolChoice::Auto,
+                None,
+                &cancel,
+                |event| {
+                    events.push(event.clone());
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        let requests = server.join().unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["max_tokens"], 32_000);
+        assert_eq!(requests[0]["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(requests[1]["max_tokens"], 32_000);
+        assert!(requests[1].get("reasoning_effort").is_none());
+        assert!(requests[1].get("thinking").is_none());
+        assert_eq!(requests[1]["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            requests[1]["messages"][1]["content"],
+            FINAL_ANSWER_RECOVERY_PROMPT
+        );
+        assert_eq!(completion.content, "answer");
+        assert_eq!(completion.reasoning, "thinking");
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ReasoningDelta("thinking".to_string()),
+                StreamEvent::TextDelta("answer".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_stops_after_one_reasoning_only_recovery() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response_body in [
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"first\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"second\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut headers = Vec::new();
+                loop {
+                    let mut byte = [0u8; 1];
+                    stream.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                    if headers.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let header_text = String::from_utf8_lossy(&headers);
+                let content_length = header_text
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .or_else(|| line.strip_prefix("Content-Length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap();
+                let mut body = vec![0u8; content_length];
+                stream.read_exact(&mut body).unwrap();
+                requests.push(serde_json::from_slice::<Value>(&body).unwrap());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+
+        let client = OpenAiCompatibleClient::new(LlmSettings {
+            api_key: "test".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            base_url: format!("http://{address}/v1"),
+            ..LlmSettings::default()
+        })
+        .unwrap();
+        let error = client
+            .stream(
+                &[json!({"role": "user", "content": "question"})],
+                &[],
+                ToolChoice::Auto,
+                None,
+                &CancellationToken::new(),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        let requests = server.join().unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            requests[1]["messages"][1]["content"],
+            FINAL_ANSWER_RECOVERY_PROMPT
+        );
+        assert!(error.contains("output budget"));
+        assert!(error.contains("finish_reason: length"));
+    }
+
+    #[test]
     fn completion_url_and_sse_tool_deltas_are_stable() {
         assert_eq!(
             OpenAiCompatibleClient::completion_url("http://localhost:1/v1"),
@@ -1833,6 +2850,8 @@ mod tests {
         );
         let mut completion = Completion {
             content: String::new(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             tool_calls: vec![],
             prompt_tokens: None,
             completion_tokens: None,
@@ -1863,6 +2882,195 @@ mod tests {
             ]
         );
         assert_eq!(completion.tool_calls[0].function.name, "rust_clock");
+    }
+
+    #[test]
+    fn reasoning_content_is_parsed_for_sync_and_streaming_responses() {
+        let completion = completion_from_response(&json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_content": "thinking"
+                }
+            }]
+        }))
+        .unwrap();
+        assert_eq!(completion.reasoning, "thinking");
+
+        let multipart = completion_from_response(&json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "plan"},
+                        {"type": "text", "text": "answer"}
+                    ]
+                }
+            }]
+        }))
+        .unwrap();
+        assert_eq!(multipart.reasoning, "plan");
+        assert_eq!(multipart.content, "answer");
+
+        let mut streamed = Completion {
+            content: String::new(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
+            tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
+            cached_input_tokens: None,
+            cache_write_tokens: None,
+            finish_reason: None,
+        };
+        let mut events = Vec::new();
+        consume_sse_line(
+            r#"data: {"choices":[{"delta":{"reasoning_text":"thinking"}}]}"#,
+            &mut streamed,
+            &mut |event| {
+                events.push(event.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(streamed.reasoning, "thinking");
+        assert_eq!(
+            events,
+            vec![StreamEvent::ReasoningDelta("thinking".to_string())]
+        );
+    }
+
+    #[test]
+    fn reasoning_delta_is_emitted_before_content_in_one_sse_frame() {
+        let mut completion = Completion {
+            content: String::new(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
+            tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
+            cached_input_tokens: None,
+            cache_write_tokens: None,
+            finish_reason: None,
+        };
+        let mut events = Vec::new();
+        consume_sse_line(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"thinking","content":"answer"}}]}"#,
+            &mut completion,
+            &mut |event| {
+                events.push(event.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ReasoningDelta("thinking".to_string()),
+                StreamEvent::TextDelta("answer".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn sse_reasoning_opaque_is_emitted_once_before_reasoning_and_text() {
+        let mut completion = Completion {
+            content: String::new(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
+            tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
+            cached_input_tokens: None,
+            cache_write_tokens: None,
+            finish_reason: None,
+        };
+        let mut events = Vec::new();
+        consume_sse_line(
+            r#"data: {"choices":[{"delta":{"reasoning_opaque":"sig","reasoning_text":"thinking","content":"answer"}}]}"#,
+            &mut completion,
+            &mut |event| {
+                events.push(event.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        consume_sse_line(
+            r#"data: {"choices":[{"delta":{"reasoning_opaque":"sig"}}]}"#,
+            &mut completion,
+            &mut |event| {
+                events.push(event.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ReasoningOpaque("sig".to_string()),
+                StreamEvent::ReasoningDelta("thinking".to_string()),
+                StreamEvent::TextDelta("answer".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sse_rejects_multiple_reasoning_opaque_values() {
+        let mut completion = Completion {
+            content: String::new(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
+            tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
+            cached_input_tokens: None,
+            cache_write_tokens: None,
+            finish_reason: None,
+        };
+        let mut events = Vec::new();
+        consume_sse_line(
+            r#"data: {"choices":[{"delta":{"reasoning_opaque":"first"}}]}"#,
+            &mut completion,
+            &mut |event| {
+                events.push(event.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        let error = consume_sse_line(
+            r#"data: {"choices":[{"delta":{"reasoning_opaque":"second"}}]}"#,
+            &mut completion,
+            &mut |event| {
+                events.push(event.clone());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("multiple reasoning_opaque"));
+        assert_eq!(
+            events,
+            vec![StreamEvent::ReasoningOpaque("first".to_string())]
+        );
+        assert_eq!(completion.reasoning_opaque.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn reasoning_only_length_response_has_actionable_error() {
+        let completion = Completion {
+            content: String::new(),
+            reasoning: "still thinking".to_string(),
+            reasoning_opaque: None,
+            tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
+            cached_input_tokens: None,
+            cache_write_tokens: None,
+            finish_reason: Some("length".to_string()),
+        };
+        let error = empty_completion_error(&completion).to_string();
+        assert!(error.contains("output budget"));
+        assert!(error.contains("reasoning"));
     }
 
     #[test]
@@ -2051,6 +3259,8 @@ mod tests {
     fn sse_provider_errors_are_preserved() {
         let mut completion = Completion {
             content: String::new(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             tool_calls: Vec::new(),
             prompt_tokens: None,
             completion_tokens: None,
@@ -2083,6 +3293,8 @@ mod tests {
     fn stream_usage_is_parsed_without_content_deltas() {
         let mut completion = Completion {
             content: String::new(),
+            reasoning: String::new(),
+            reasoning_opaque: None,
             tool_calls: Vec::new(),
             prompt_tokens: None,
             completion_tokens: None,

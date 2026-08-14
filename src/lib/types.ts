@@ -18,6 +18,8 @@ export interface AgentMemoryEntry {
   id: string;
   role: string;
   content: string;
+  reasoning?: string;
+  reasoning_opaque?: string | null;
   created_at: number;
   tool_call_id: string | null;
   tool_names: string[];
@@ -57,6 +59,7 @@ export interface AgentMessageToolCall {
 }
 
 export type AssistantPart =
+  | { type: "reasoning"; id: string; start: number; end: number }
   | { type: "text"; id: string; start: number; end: number }
   | { type: "tool"; id: string; index: number; call_id: string; name: string };
 
@@ -88,6 +91,8 @@ export interface TaskMessage {
   task_id: string;
   role: "user" | "assistant" | "system" | "tool";
   content: string;
+  reasoning?: string;
+  reasoning_opaque?: string | null;
   created_at: number;
   streaming: boolean;
   parts?: AssistantPart[];
@@ -192,6 +197,8 @@ export interface Task {
 }
 
 export type PersistedStreamEvent =
+  | { kind: "reasoning_delta"; delta: string }
+  | { kind: "reasoning_opaque"; value: string }
   | { kind: "text_delta"; delta: string }
   | {
       kind: "tool_call_delta";

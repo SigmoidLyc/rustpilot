@@ -19,6 +19,12 @@ pub(crate) const PAGE_SIZE: usize = 256;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum PersistedStreamEvent {
+    ReasoningDelta {
+        delta: String,
+    },
+    ReasoningOpaque {
+        value: String,
+    },
     TextDelta {
         delta: String,
     },
@@ -83,6 +89,16 @@ pub(crate) fn decode_persisted_stream_event(payload: &str) -> Result<PersistedSt
 
 pub(crate) fn persisted_stream_event(event: &llm::StreamEvent) -> Option<PersistedStreamEvent> {
     match event {
+        llm::StreamEvent::ReasoningDelta(delta) if !delta.is_empty() => {
+            Some(PersistedStreamEvent::ReasoningDelta {
+                delta: delta.clone(),
+            })
+        }
+        llm::StreamEvent::ReasoningOpaque(value) if !value.is_empty() => {
+            Some(PersistedStreamEvent::ReasoningOpaque {
+                value: value.clone(),
+            })
+        }
         llm::StreamEvent::TextDelta(delta) if !delta.is_empty() => {
             Some(PersistedStreamEvent::TextDelta {
                 delta: delta.clone(),
@@ -120,6 +136,12 @@ pub(crate) fn apply_persisted_stream_event(
         })?;
     message.streaming = true;
     match event {
+        PersistedStreamEvent::ReasoningDelta { delta } => {
+            apply_stream_event(message, &llm::StreamEvent::ReasoningDelta(delta.clone()));
+        }
+        PersistedStreamEvent::ReasoningOpaque { value } => {
+            apply_stream_event(message, &llm::StreamEvent::ReasoningOpaque(value.clone()));
+        }
         PersistedStreamEvent::TextDelta { delta } => {
             apply_stream_event(message, &llm::StreamEvent::TextDelta(delta.clone()));
         }

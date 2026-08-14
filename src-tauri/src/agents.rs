@@ -16,6 +16,9 @@ use crate::{
     tool::ToolCollection,
 };
 
+pub(crate) const MCP_DYNAMIC_TOOL_PREFIX: &str = "rust_mcp_";
+pub(crate) const TERMINATE_TOOL_NAME: &str = "rust_terminate";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentSpec {
     pub key: String,
@@ -177,6 +180,23 @@ impl AgentSpec {
             return Err("All agent tools must use the rust_ prefix.".to_string());
         }
         Ok(())
+    }
+
+    pub(crate) fn allows_tool(&self, name: &str) -> bool {
+        if name == TERMINATE_TOOL_NAME {
+            return true;
+        }
+        if name.starts_with(MCP_DYNAMIC_TOOL_PREFIX) {
+            return self.uses_mcp;
+        }
+        if name.starts_with("rust_sandbox_") && !self.uses_sandbox {
+            return false;
+        }
+        if name == "rust_mcp" && !self.uses_mcp {
+            return false;
+        }
+        self.tool_names.iter().any(|tool| tool == name)
+            || self.special_tool_names.iter().any(|tool| tool == name)
     }
 }
 

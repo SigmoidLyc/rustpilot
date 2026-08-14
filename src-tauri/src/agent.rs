@@ -67,6 +67,10 @@ pub struct Message {
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub reasoning_opaque: Option<String>,
+    #[serde(default)]
     pub tool_calls: Option<Vec<MessageToolCall>>,
     #[serde(default)]
     pub name: Option<String>,
@@ -81,6 +85,8 @@ impl Message {
         Self {
             role: Role::User,
             content: Some(content.into()),
+            reasoning_content: None,
+            reasoning_opaque: None,
             tool_calls: None,
             name: None,
             tool_call_id: None,
@@ -92,6 +98,8 @@ impl Message {
         Self {
             role: Role::System,
             content: Some(content.into()),
+            reasoning_content: None,
+            reasoning_opaque: None,
             tool_calls: None,
             name: None,
             tool_call_id: None,
@@ -103,6 +111,8 @@ impl Message {
         Self {
             role: Role::Assistant,
             content,
+            reasoning_content: None,
+            reasoning_opaque: None,
             tool_calls: None,
             name: None,
             tool_call_id: None,
@@ -114,6 +124,8 @@ impl Message {
         Self {
             role: Role::Assistant,
             content,
+            reasoning_content: None,
+            reasoning_opaque: None,
             tool_calls: Some(tool_calls),
             name: None,
             tool_call_id: None,
@@ -129,6 +141,8 @@ impl Message {
         Self {
             role: Role::Tool,
             content: Some(content.into()),
+            reasoning_content: None,
+            reasoning_opaque: None,
             tool_calls: None,
             name: Some(name.into()),
             tool_call_id: Some(tool_call_id.into()),
@@ -171,6 +185,12 @@ impl Message {
         }
         if let Some(tool_calls) = &self.tool_calls {
             value["tool_calls"] = serde_json::to_value(tool_calls).unwrap_or_else(|_| json!([]));
+        }
+        if let Some(reasoning) = &self.reasoning_content {
+            value["reasoning_content"] = Value::String(reasoning.clone());
+        }
+        if let Some(reasoning_opaque) = &self.reasoning_opaque {
+            value["reasoning_opaque"] = Value::String(reasoning_opaque.clone());
         }
         if let Some(name) = &self.name {
             value["name"] = Value::String(name.clone());
@@ -446,6 +466,25 @@ impl ToolCallAgentRuntime {
         content: Option<String>,
         tool_calls: Vec<MessageToolCall>,
     ) -> bool {
+        self.set_response_with_reasoning(content, None, tool_calls)
+    }
+
+    pub fn set_response_with_reasoning(
+        &mut self,
+        content: Option<String>,
+        reasoning: Option<String>,
+        tool_calls: Vec<MessageToolCall>,
+    ) -> bool {
+        self.set_response_with_reasoning_metadata(content, reasoning, None, tool_calls)
+    }
+
+    pub fn set_response_with_reasoning_metadata(
+        &mut self,
+        content: Option<String>,
+        reasoning: Option<String>,
+        reasoning_opaque: Option<String>,
+        tool_calls: Vec<MessageToolCall>,
+    ) -> bool {
         self.tool_calls = tool_calls.clone();
         let should_continue = match self.tool_choice {
             ToolChoice::None => content.as_deref().is_some_and(|value| !value.is_empty()),
@@ -454,9 +493,10 @@ impl ToolCallAgentRuntime {
                 !tool_calls.is_empty() || content.as_deref().is_some_and(|v| !v.is_empty())
             }
         };
-        self.base
-            .memory
-            .add_message(Message::assistant_with_tools(content, tool_calls));
+        let mut message = Message::assistant_with_tools(content, tool_calls);
+        message.reasoning_content = reasoning.filter(|value| !value.is_empty());
+        message.reasoning_opaque = reasoning_opaque.filter(|value| !value.is_empty());
+        self.base.memory.add_message(message);
         should_continue
     }
 

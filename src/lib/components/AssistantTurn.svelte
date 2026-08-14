@@ -10,6 +10,11 @@
   let hasEmbeddedProcess = false;
   let fallbackProcessMessage: TaskMessage | null = null;
   let isStreaming = false;
+  let activeStreamingMessage: TaskMessage | null = null;
+  let pendingReasoningMessage: TaskMessage | null = null;
+  let hasStreamingOutput = false;
+  let hasStreamingReasoning = false;
+  let showProgressLabel = false;
   type TurnPart = { message: TaskMessage; part: AssistantPart };
   type TurnToolPart = { message: TaskMessage; part: AssistantToolPart };
   let turnParts: TurnPart[] = [];
@@ -18,7 +23,31 @@
     orderedParts(message).some((part) => part.type === "tool")
   );
   $: fallbackProcessMessage = hasEmbeddedProcess ? null : (messages.at(-1) ?? null);
-  $: isStreaming = messages.some((message) => message.streaming);
+  $: activeStreamingMessage = messages.filter((message) => message.streaming).at(-1) ?? null;
+  $: isStreaming = activeStreamingMessage !== null;
+  $: pendingReasoningMessage =
+    !isStreaming &&
+    ["planning", "executing", "verifying", "waiting_approval"].includes(task.status)
+      ? messages
+          .filter(
+            (message) =>
+              Boolean(message.reasoning?.trim()) &&
+              message.content.trim().length === 0 &&
+              message.tool_calls.length === 0
+          )
+          .at(-1) ?? null
+      : null;
+  $: showProgressLabel = isStreaming || pendingReasoningMessage !== null;
+  $: hasStreamingOutput = activeStreamingMessage
+    ? orderedParts(activeStreamingMessage).some(
+        (part) =>
+          part.type === "tool" ||
+          (part.type === "text" && activeStreamingMessage && partText(activeStreamingMessage, part).trim().length > 0)
+      )
+    : false;
+  $: hasStreamingReasoning = Boolean(
+    activeStreamingMessage?.reasoning?.trim() || pendingReasoningMessage?.reasoning?.trim()
+  );
   $: turnParts = messages.flatMap((message) =>
     orderedParts(message).map((part) => ({ message, part }))
   );
@@ -27,6 +56,14 @@
     if (message.parts && message.parts.length > 0) return message.parts;
 
     const parts: AssistantPart[] = [];
+    if ((message.reasoning ?? "").length > 0) {
+      parts.push({
+        type: "reasoning",
+        id: `${message.id}:reasoning`,
+        start: 0,
+        end: (message.reasoning ?? "").length
+      });
+    }
     if (message.content.length > 0) {
       parts.push({
         type: "text",
@@ -48,7 +85,9 @@
   }
 
   function partText(message: TaskMessage, part: AssistantPart): string {
-    return part.type === "text" ? message.content.slice(part.start, part.end) : "";
+    if (part.type === "text") return message.content.slice(part.start, part.end);
+    if (part.type === "reasoning") return (message.reasoning ?? "").slice(part.start, part.end);
+    return "";
   }
 
   function isLastPart(message: TaskMessage, part: AssistantPart): boolean {
@@ -103,8 +142,8 @@
   <div class="message-body">
     <div class="message-meta">
       <span>RustPilot</span>
-      {#if isStreaming}
-        <span class="streaming-label">working</span>
+      {#if showProgressLabel && !hasStreamingOutput}
+        <span class="streaming-label">{hasStreamingReasoning ? "thinking" : "planning"}</span>
       {/if}
     </div>
 
