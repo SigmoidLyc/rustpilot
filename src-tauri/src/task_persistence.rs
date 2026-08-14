@@ -16,16 +16,19 @@ use std::{
 use rusqlite::{params, Connection, Transaction};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::Notify;
+use tokio::sync::{oneshot, Notify};
 use tracing::{error, warn};
 
 use super::{
+    agent_loop::provenance::ContextEventRecord,
     llm,
     task_events::{
         apply_persisted_stream_event, persisted_stream_event, PersistedStreamEvent,
         PersistedTaskEvent, TaskEvent,
     },
-    task_storage::{insert_task_state, set_task_event_floor},
+    task_storage::{
+        insert_agent_event, insert_context_event, insert_task_state, set_task_event_floor,
+    },
     Task,
 };
 
@@ -44,12 +47,27 @@ pub(crate) enum PendingTaskEvent {
         event: String,
         payload: Value,
     },
+    Agent {
+        revision: u64,
+        turn_id: String,
+        step: u32,
+        kind: String,
+        occurred_at: i64,
+        payload: Value,
+    },
+    Context {
+        revision: u64,
+        event: ContextEventRecord,
+    },
 }
 
 impl PendingTaskEvent {
     fn revision(&self) -> u64 {
         match self {
-            Self::Stream { revision, .. } | Self::Task { revision, .. } => *revision,
+            Self::Stream { revision, .. }
+            | Self::Task { revision, .. }
+            | Self::Agent { revision, .. }
+            | Self::Context { revision, .. } => *revision,
         }
     }
 }
@@ -233,6 +251,7 @@ pub(crate) fn merge_pending_task_writes(
 #[derive(Clone)]
 pub(crate) struct TaskPersistence {
     pending: Arc<Mutex<PendingTaskWrites>>,
+    barriers: Arc<Mutex<Vec<oneshot::Sender<Result<(), String>>>>>,
     notify: Arc<Notify>,
     started: Arc<AtomicBool>,
 }
@@ -248,6 +267,7 @@ impl TaskPersistence {
     pub(crate) fn new() -> Self {
         Self {
             pending: Arc::new(Mutex::new(PendingTaskWrites::default())),
+            barriers: Arc::new(Mutex::new(Vec::new())),
             notify: Arc::new(Notify::new()),
             started: Arc::new(AtomicBool::new(false)),
         }
@@ -266,6 +286,7 @@ impl TaskPersistence {
             return Ok(());
         }
         let pending = Arc::clone(&self.pending);
+        let barriers = Arc::clone(&self.barriers);
         let notify = Arc::clone(&self.notify);
         let publisher = TaskEventPublisher {
             app,
@@ -276,6 +297,7 @@ impl TaskPersistence {
             task_writer_loop(
                 connection,
                 pending,
+                barriers,
                 notify,
                 durable_tasks,
                 event_bytes,
@@ -287,6 +309,14 @@ impl TaskPersistence {
     }
 
     pub(crate) fn enqueue_upsert(&self, task: Task) -> Result<(), String> {
+        self.enqueue_upsert_with_events(task, Vec::new())
+    }
+
+    pub(crate) fn enqueue_upsert_with_events(
+        &self,
+        task: Task,
+        events: Vec<PendingTaskEvent>,
+    ) -> Result<(), String> {
         if !self.started.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -297,7 +327,7 @@ impl TaskPersistence {
             .map_err(|_| "Task persistence queue is poisoned".to_string())?;
         let write = PendingTaskWrite::Upsert {
             task: Box::new(task),
-            events: Vec::new(),
+            events,
         };
         merge_into_pending(&mut pending, task_id, write);
         drop(pending);
@@ -393,6 +423,85 @@ impl TaskPersistence {
         self.notify.notify_one();
         Ok(())
     }
+
+    pub(crate) fn enqueue_agent_event(
+        &self,
+        task_id: &str,
+        revision: u64,
+        turn_id: String,
+        step: u32,
+        kind: String,
+        occurred_at: i64,
+        payload: Value,
+    ) -> Result<(), String> {
+        if !self.started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "Task persistence queue is poisoned".to_string())?;
+        merge_into_pending(
+            &mut pending,
+            task_id.to_string(),
+            PendingTaskWrite::Events {
+                events: vec![PendingTaskEvent::Agent {
+                    revision,
+                    turn_id,
+                    step,
+                    kind,
+                    occurred_at,
+                    payload,
+                }],
+            },
+        );
+        drop(pending);
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    pub(crate) fn enqueue_context_event(
+        &self,
+        task_id: &str,
+        revision: u64,
+        event: ContextEventRecord,
+    ) -> Result<(), String> {
+        if !self.started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "Task persistence queue is poisoned".to_string())?;
+        merge_into_pending(
+            &mut pending,
+            task_id.to_string(),
+            PendingTaskWrite::Events {
+                events: vec![PendingTaskEvent::Context { revision, event }],
+            },
+        );
+        drop(pending);
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    pub(crate) async fn flush(&self) -> Result<(), String> {
+        if !self.started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut barriers = self
+                .barriers
+                .lock()
+                .map_err(|_| "Task persistence barriers are poisoned".to_string())?;
+            barriers.push(sender);
+        }
+        self.notify.notify_one();
+        receiver.await.map_err(|_| {
+            "Task persistence writer stopped before the checkpoint completed".to_string()
+        })?
+    }
 }
 
 fn merge_into_pending(pending: &mut PendingTaskWrites, task_id: String, write: PendingTaskWrite) {
@@ -440,12 +549,19 @@ pub(crate) struct ProjectedTaskChanges {
 }
 
 fn pending_event_bytes(event: &PendingTaskEvent) -> Result<u64, String> {
+    if matches!(
+        event,
+        PendingTaskEvent::Agent { .. } | PendingTaskEvent::Context { .. }
+    ) {
+        return Ok(0);
+    }
     let payload = match event {
         PendingTaskEvent::Stream { event, .. } => serde_json::to_vec(event),
         PendingTaskEvent::Task { event, payload, .. } => serde_json::to_vec(&PersistedTaskEvent {
             event: event.clone(),
             payload: payload.clone(),
         }),
+        PendingTaskEvent::Agent { .. } | PendingTaskEvent::Context { .. } => Ok(Vec::new()),
     }
     .map_err(|error| format!("Unable to encode task event: {error}"))?;
     Ok(payload.len() as u64 + 64)
@@ -550,6 +666,9 @@ pub(crate) fn insert_task_event(
                 payload: payload.clone(),
             }),
         ),
+        PendingTaskEvent::Agent { .. } | PendingTaskEvent::Context { .. } => {
+            return Err("Agent lifecycle events must use the agent event table".to_string())
+        }
     };
     let payload = payload.map_err(|error| format!("Unable to encode task event: {error}"))?;
     let stored_payload = serde_json::to_string(&payload)
@@ -576,6 +695,44 @@ pub(crate) fn insert_task_event(
             payload
         },
     })
+}
+
+fn insert_pending_event(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    event: &PendingTaskEvent,
+) -> Result<Option<TaskEvent>, String> {
+    match event {
+        PendingTaskEvent::Agent {
+            revision,
+            turn_id,
+            step,
+            kind,
+            occurred_at,
+            payload,
+        } => {
+            let stored_payload = serde_json::to_string(payload)
+                .map_err(|error| format!("Unable to encode agent event payload: {error}"))?;
+            insert_agent_event(
+                transaction,
+                task_id,
+                *revision,
+                turn_id,
+                *step,
+                kind,
+                *occurred_at,
+                &stored_payload,
+            )?;
+            Ok(None)
+        }
+        PendingTaskEvent::Context { event, .. } => {
+            insert_context_event(transaction, task_id, event)?;
+            Ok(None)
+        }
+        PendingTaskEvent::Stream { .. } | PendingTaskEvent::Task { .. } => {
+            insert_task_event(transaction, task_id, event).map(Some)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -629,11 +786,11 @@ pub(crate) fn commit_task_writes(
                         })?;
                     insert_task_state(&transaction, task)?;
                     for pending_event in events {
-                        committed_events.push(insert_task_event(
-                            &transaction,
-                            task_id,
-                            pending_event,
-                        )?);
+                        if let Some(committed) =
+                            insert_pending_event(&transaction, task_id, pending_event)?
+                        {
+                            committed_events.push(committed);
+                        }
                     }
                 }
                 PendingTaskWrite::Events { events } => {
@@ -658,20 +815,20 @@ pub(crate) fn commit_task_writes(
                         snapshot_tasks.insert(task_id.clone());
                     }
                     for pending_event in events {
-                        committed_events.push(insert_task_event(
-                            &transaction,
-                            task_id,
-                            pending_event,
-                        )?);
+                        if let Some(committed) =
+                            insert_pending_event(&transaction, task_id, pending_event)?
+                        {
+                            committed_events.push(committed);
+                        }
                     }
                 }
                 PendingTaskWrite::Delete { events, .. } => {
                     for pending_event in events {
-                        committed_events.push(insert_task_event(
-                            &transaction,
-                            task_id,
-                            pending_event,
-                        )?);
+                        if let Some(committed) =
+                            insert_pending_event(&transaction, task_id, pending_event)?
+                        {
+                            committed_events.push(committed);
+                        }
                     }
                     transaction
                         .execute("DELETE FROM task_state WHERE id = ?1", params![task_id])
@@ -719,6 +876,7 @@ pub(crate) fn commit_task_writes(
 async fn task_writer_loop(
     mut connection: Connection,
     pending: Arc<Mutex<PendingTaskWrites>>,
+    barriers: Arc<Mutex<Vec<oneshot::Sender<Result<(), String>>>>>,
     notify: Arc<Notify>,
     mut durable_tasks: HashMap<String, Task>,
     mut event_bytes: HashMap<String, u64>,
@@ -728,10 +886,14 @@ async fn task_writer_loop(
         notify.notified().await;
         tokio::time::sleep(Duration::from_millis(WRITE_BATCH_DELAY_MS)).await;
         let writes = match take_pending_task_writes(&pending) {
-            Ok(writes) if writes.by_task.is_empty() => continue,
+            Ok(writes) if writes.by_task.is_empty() => {
+                complete_idle_barriers(&pending, &barriers, Ok(()));
+                continue;
+            }
             Ok(writes) => writes,
             Err(error) => {
                 error!("Task persistence stopped: {error}");
+                complete_all_barriers(&barriers, Err(error));
                 return;
             }
         };
@@ -753,6 +915,13 @@ async fn task_writer_loop(
             Ok(result) => result,
             Err(error) => {
                 error!("Task persistence worker failed: {error}");
+                complete_all_barriers(
+                    &barriers,
+                    Err(
+                        "Task persistence worker failed before the checkpoint completed"
+                            .to_string(),
+                    ),
+                );
                 return;
             }
         };
@@ -824,5 +993,40 @@ async fn task_writer_loop(
                 warn!("Unable to emit task_event: {error}");
             }
         }
+        complete_idle_barriers(&pending, &barriers, Ok(()));
+    }
+}
+
+fn complete_idle_barriers(
+    pending: &Arc<Mutex<PendingTaskWrites>>,
+    barriers: &Arc<Mutex<Vec<oneshot::Sender<Result<(), String>>>>>,
+    result: Result<(), String>,
+) {
+    let idle = pending
+        .lock()
+        .map(|pending| pending.by_task.is_empty())
+        .unwrap_or(false);
+    if !idle {
+        return;
+    }
+    let waiters = barriers
+        .lock()
+        .map(|mut barriers| std::mem::take(&mut *barriers))
+        .unwrap_or_default();
+    for waiter in waiters {
+        let _ = waiter.send(result.clone());
+    }
+}
+
+fn complete_all_barriers(
+    barriers: &Arc<Mutex<Vec<oneshot::Sender<Result<(), String>>>>>,
+    result: Result<(), String>,
+) {
+    let waiters = barriers
+        .lock()
+        .map(|mut barriers| std::mem::take(&mut *barriers))
+        .unwrap_or_default();
+    for waiter in waiters {
+        let _ = waiter.send(result.clone());
     }
 }

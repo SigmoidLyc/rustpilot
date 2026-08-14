@@ -18,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::{FunctionCall, Message, MessageToolCall, Role, ToolChoice};
 
-pub const REASONING_MODELS: &[&str] = &["o1", "o3-mini"];
 pub const MULTIMODAL_MODELS: &[&str] = &[
     "gpt-4-vision-preview",
     "gpt-4o",
@@ -28,12 +27,80 @@ pub const MULTIMODAL_MODELS: &[&str] = &[
     "claude-3-haiku-20240307",
 ];
 
-const LLM_MAX_ATTEMPTS: usize = 3;
-const LLM_RETRY_DELAY_SECS: u64 = 5;
+const LLM_MAX_ATTEMPTS: usize = crate::agent_loop::retry::MAX_RETRIES + 1;
 const MAX_PROVIDER_DETAIL_CHARS: usize = 4096;
 const DEEPSEEK_V4_DEFAULT_MAX_TOKENS: u32 = 32_000;
 const FINAL_ANSWER_RECOVERY_PROMPT: &str =
     "The previous response ended before it produced a final answer or tool call. Complete the immediately preceding task now. Output only the concise user-facing answer, a valid tool call, or the requested structured format; do not discuss this recovery instruction.";
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Off,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+    Ultra,
+}
+
+impl ReasoningEffort {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "minimal" | "min" => Some(Self::Minimal),
+            "off" => Some(Self::Off),
+            "low" => Some(Self::Low),
+            "medium" | "med" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" | "x-high" | "extra-high" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
+            "ultra" => Some(Self::Ultra),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+        }
+    }
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Minimal => "Minimal",
+            Self::Off => "Off",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::XHigh => "XHigh",
+            Self::Max => "Max",
+            Self::Ultra => "Ultra",
+        }
+    }
+}
+
+pub fn reasoning_efforts_for_model(model: &str, base_url: &str) -> &'static [ReasoningEffort] {
+    crate::model_catalog::reasoning_efforts_for_model(model, base_url, "")
+}
+
+pub fn validate_reasoning_effort(
+    model: &str,
+    base_url: &str,
+    effort: ReasoningEffort,
+) -> Result<(), String> {
+    crate::model_catalog::validate_reasoning_effort(model, base_url, "", effort)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestMode {
@@ -83,6 +150,8 @@ pub struct LlmSettings {
     pub api_version: String,
     #[serde(default)]
     pub prompt_cache: PromptCacheMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(skip)]
     pub session_id: Option<String>,
     #[serde(skip)]
@@ -135,6 +204,7 @@ impl Default for LlmSettings {
             api_type: "openai".to_string(),
             api_version: String::new(),
             prompt_cache: PromptCacheMode::Auto,
+            reasoning_effort: None,
             session_id: None,
             tool_schema_hash: None,
         }
@@ -419,15 +489,17 @@ async fn wait_for_retry(
     error: &LlmError,
     cancel: &CancellationToken,
 ) -> Result<(), LlmError> {
+    let delay = crate::agent_loop::retry::delay_for_attempt(attempt, &error.to_string());
     tracing::warn!(
         attempt = attempt + 1,
         max_attempts = LLM_MAX_ATTEMPTS,
         error = %error,
+        delay_ms = delay.as_millis() as u64,
         "LLM request failed; retrying after delay"
     );
     tokio::select! {
         _ = cancel.cancelled() => Err(LlmError::Cancelled),
-        _ = tokio::time::sleep(Duration::from_secs(LLM_RETRY_DELAY_SECS)) => Ok(()),
+        _ = tokio::time::sleep(delay) => Ok(()),
     }
 }
 
@@ -878,6 +950,15 @@ impl std::fmt::Debug for OpenAiCompatibleClient {
 
 impl OpenAiCompatibleClient {
     pub fn new(settings: LlmSettings) -> Result<Self, LlmError> {
+        if let Some(effort) = settings.reasoning_effort {
+            crate::model_catalog::validate_reasoning_effort(
+                &settings.model,
+                &settings.base_url,
+                &settings.api_type,
+                effort,
+            )
+            .map_err(LlmError::InvalidInput)?;
+        }
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .build()?;
@@ -1433,6 +1514,7 @@ impl OpenAiCompatibleClient {
     where
         F: FnMut(&StreamEvent) -> Result<(), LlmError>,
     {
+        let mut on_retry = |_: usize, _: &LlmError, _: Duration| {};
         self.stream_with_mode(
             messages,
             tools,
@@ -1441,6 +1523,34 @@ impl OpenAiCompatibleClient {
             cancel,
             RequestMode::Normal,
             &mut on_event,
+            &mut on_retry,
+        )
+        .await
+    }
+
+    pub async fn stream_with_retry_observer<F, R>(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        tool_choice: ToolChoice,
+        temperature: Option<f32>,
+        cancel: &CancellationToken,
+        mut on_event: F,
+        mut on_retry: R,
+    ) -> Result<Completion, LlmError>
+    where
+        F: FnMut(&StreamEvent) -> Result<(), LlmError>,
+        R: FnMut(usize, &LlmError, Duration),
+    {
+        self.stream_with_mode(
+            messages,
+            tools,
+            tool_choice,
+            temperature,
+            cancel,
+            RequestMode::Normal,
+            &mut on_event,
+            &mut on_retry,
         )
         .await
     }
@@ -1457,6 +1567,7 @@ impl OpenAiCompatibleClient {
     where
         F: FnMut(&StreamEvent) -> Result<(), LlmError>,
     {
+        let mut on_retry = |_: usize, _: &LlmError, _: Duration| {};
         self.stream_with_mode(
             messages,
             tools,
@@ -1465,6 +1576,7 @@ impl OpenAiCompatibleClient {
             cancel,
             RequestMode::FinalAnswerRecovery,
             &mut on_event,
+            &mut on_retry,
         )
         .await
     }
@@ -1478,6 +1590,7 @@ impl OpenAiCompatibleClient {
         cancel: &CancellationToken,
         mode: RequestMode,
         on_event: &mut F,
+        on_retry: &mut impl FnMut(usize, &LlmError, Duration),
     ) -> Result<Completion, LlmError>
     where
         F: FnMut(&StreamEvent) -> Result<(), LlmError>,
@@ -1540,6 +1653,11 @@ impl OpenAiCompatibleClient {
                             && attempt + 1 < max_attempts
                             && is_retryable_error(&failure.error) =>
                     {
+                        let delay = crate::agent_loop::retry::delay_for_attempt(
+                            attempt,
+                            &failure.error.to_string(),
+                        );
+                        on_retry(attempt + 1, &failure.error, delay);
                         wait_for_retry(attempt, &failure.error, cancel).await?;
                     }
                     Err(failure) => return Err(failure.error),
@@ -1790,11 +1908,19 @@ impl OpenAiCompatibleClient {
             body["tools"] = Value::Array(tools.to_vec());
         }
         let max_tokens = self.max_tokens_for_mode(mode);
-        if REASONING_MODELS.contains(&self.settings.model.as_str()) {
+        let openai_reasoning_model = crate::model_catalog::uses_max_completion_tokens(
+            &self.settings.model,
+            &self.settings.base_url,
+            &self.settings.api_type,
+        );
+        if openai_reasoning_model {
             body["max_completion_tokens"] = json!(max_tokens);
         } else {
             body["max_tokens"] = json!(max_tokens);
             body["temperature"] = json!(temperature.unwrap_or(self.settings.temperature));
+        }
+        if let Some(effort) = self.settings.reasoning_effort {
+            self.apply_reasoning_effort(&mut body, effort);
         }
         if apply_extensions {
             self.apply_prompt_cache(&mut body, stream);
@@ -1803,10 +1929,28 @@ impl OpenAiCompatibleClient {
     }
 
     fn is_deepseek_v4(&self) -> bool {
-        let model = self.settings.model.to_ascii_lowercase();
-        let base_url = self.settings.base_url.to_ascii_lowercase();
-        (model.contains("deepseek-v4") || model.contains("deepseek/v4"))
-            || (base_url.contains("deepseek") && model.contains("v4"))
+        crate::model_catalog::is_deepseek_v4(
+            &self.settings.model,
+            &self.settings.base_url,
+            &self.settings.api_type,
+        )
+    }
+
+    fn apply_reasoning_effort(&self, body: &mut Value, effort: ReasoningEffort) {
+        debug_assert!(crate::model_catalog::validate_reasoning_effort(
+            &self.settings.model,
+            &self.settings.base_url,
+            &self.settings.api_type,
+            effort,
+        )
+        .is_ok());
+        let _ = crate::model_catalog::apply_reasoning_effort(
+            body,
+            &self.settings.model,
+            &self.settings.base_url,
+            &self.settings.api_type,
+            effort,
+        );
     }
 
     fn max_tokens_for_mode(&self, _mode: RequestMode) -> u32 {
@@ -1980,31 +2124,7 @@ impl OpenAiCompatibleClient {
 }
 
 pub fn model_supports_images(model: &str) -> bool {
-    if MULTIMODAL_MODELS.contains(&model) {
-        return true;
-    }
-    let normalized = model.to_ascii_lowercase();
-    [
-        "vision",
-        "-vl",
-        "_vl",
-        "gemini",
-        "claude-3",
-        "claude-4",
-        "gpt-4o",
-        "gpt-4.1",
-        "gpt-5",
-        "llava",
-        "pixtral",
-        "qwen2-vl",
-        "qwen2.5-vl",
-        "qwen3-vl",
-        "o1",
-        "o3",
-        "o4",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
+    crate::model_catalog::model_supports_images(model)
 }
 
 #[allow(clippy::upper_case_acronyms)]
@@ -2670,6 +2790,85 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_capabilities_are_model_specific() {
+        assert_eq!(
+            reasoning_efforts_for_model("deepseek-v4-flash", "https://api.deepseek.com/v1"),
+            &[
+                ReasoningEffort::Off,
+                ReasoningEffort::High,
+                ReasoningEffort::Max
+            ]
+        );
+        assert_eq!(
+            reasoning_efforts_for_model("o3-mini", "https://api.openai.com/v1"),
+            &[
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High
+            ]
+        );
+        assert!(reasoning_efforts_for_model("gpt-4o-mini", "https://api.openai.com/v1").is_empty());
+    }
+
+    #[test]
+    fn deepseek_v4_reasoning_effort_uses_official_wire_shape() {
+        let disabled = OpenAiCompatibleClient::new(LlmSettings {
+            api_key: "test".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            reasoning_effort: Some(ReasoningEffort::Off),
+            ..LlmSettings::default()
+        })
+        .unwrap();
+        let disabled_body = disabled.request_body(&[], &[], ToolChoice::Auto, None, true);
+        assert_eq!(disabled_body["thinking"]["type"], "disabled");
+        assert!(disabled_body.get("reasoning_effort").is_none());
+
+        let maximum = OpenAiCompatibleClient::new(LlmSettings {
+            api_key: "test".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            reasoning_effort: Some(ReasoningEffort::Max),
+            ..LlmSettings::default()
+        })
+        .unwrap();
+        let maximum_body = maximum.request_body(&[], &[], ToolChoice::Auto, None, true);
+        assert_eq!(maximum_body["thinking"]["type"], "enabled");
+        assert_eq!(maximum_body["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn openai_reasoning_effort_is_sent_only_for_reasoning_models() {
+        let client = OpenAiCompatibleClient::new(LlmSettings {
+            api_key: "test".to_string(),
+            model: "o3-mini".to_string(),
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..LlmSettings::default()
+        })
+        .unwrap();
+        let body = client.request_body(&[], &[], ToolChoice::Auto, None, true);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn unsupported_reasoning_effort_is_rejected_before_request() {
+        assert!(validate_reasoning_effort(
+            "gpt-4o-mini",
+            "https://api.openai.com/v1",
+            ReasoningEffort::High
+        )
+        .is_err());
+        assert!(validate_reasoning_effort(
+            "o3-mini",
+            "https://api.openai.com/v1",
+            ReasoningEffort::Max
+        )
+        .is_err());
+    }
+
+    #[test]
     fn recovery_history_does_not_append_an_incomplete_assistant_turn() {
         let original = vec![json!({
             "role": "user",
@@ -3251,8 +3450,7 @@ mod tests {
         assert!(!is_retryable_error(&LlmError::Upstream(
             "invalid prompt".to_string()
         )));
-        assert_eq!(LLM_MAX_ATTEMPTS, 3);
-        assert_eq!(LLM_RETRY_DELAY_SECS, 5);
+        assert_eq!(LLM_MAX_ATTEMPTS, crate::agent_loop::retry::MAX_RETRIES + 1);
     }
 
     #[test]

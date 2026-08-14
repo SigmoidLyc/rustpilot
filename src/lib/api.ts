@@ -9,7 +9,9 @@ import type {
   ProjectSummary,
   TaskSummary,
   SettingsInput,
-  SettingsView
+  SettingsView,
+  ReasoningEffortSelection,
+  ModelCapabilities
 } from "./types";
 
 export const isTauriRuntime =
@@ -41,25 +43,33 @@ export const createTask = (
   prompt: string,
   attachments: AttachmentInput[] = [],
   paths: AttachmentPathInput[] = [],
-  workspace?: string
+  workspace?: string,
+  model?: string,
+  reasoningEffort?: ReasoningEffortSelection
 ) =>
   invokeRust<Task>("create_task", {
     prompt,
     attachmentInputs: attachments,
     attachmentPaths: paths,
-    workspace
+    workspace,
+    ...(model === undefined ? {} : { model }),
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort })
   });
 export const continueTask = (
   taskId: string,
   prompt: string,
   attachments: AttachmentInput[] = [],
-  paths: AttachmentPathInput[] = []
+  paths: AttachmentPathInput[] = [],
+  model?: string,
+  reasoningEffort?: ReasoningEffortSelection
 ) =>
   invokeRust<Task>("continue_task", {
     taskId,
     prompt,
     attachmentInputs: attachments,
-    attachmentPaths: paths
+    attachmentPaths: paths,
+    ...(model === undefined ? {} : { model }),
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort })
   });
 export const getAttachmentPreview = (taskId: string, attachmentId: string) =>
   invokeRust<{ mime: string; data_url: string }>("get_attachment_preview", {
@@ -72,6 +82,8 @@ export const archiveTask = (taskId: string) => invokeRust<TaskSummary>("archive_
 export const restoreTask = (taskId: string) => invokeRust<TaskSummary>("restore_task", { taskId });
 export const deleteTask = (taskId: string) => invokeRust<TaskSummary>("delete_task", { taskId });
 export const getSettings = () => invokeRust<SettingsView>("get_settings");
+export const getModelCapabilities = (model: string, baseUrl: string) =>
+  invokeRust<ModelCapabilities>("get_model_capabilities", { model, baseUrl });
 export const updateSettings = (input: SettingsInput) =>
   invokeRust<SettingsView>("update_settings", { input });
 export const respondToApproval = (

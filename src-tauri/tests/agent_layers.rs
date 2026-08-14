@@ -35,6 +35,8 @@ pub struct AgentPlan {
 
 #[path = "../src/agent.rs"]
 mod agent;
+#[path = "../src/agent_loop/retry.rs"]
+mod agent_loop_retry;
 #[path = "../src/agents.rs"]
 mod agents;
 #[path = "../src/bedrock.rs"]
@@ -47,12 +49,18 @@ mod flow;
 mod llm;
 #[path = "../src/mcp_server.rs"]
 mod mcp_server;
+#[path = "../src/model_catalog.rs"]
+mod model_catalog;
 #[path = "../src/protocol.rs"]
 mod protocol;
 #[path = "../src/react.rs"]
 mod react;
 #[path = "../src/tool.rs"]
 mod tool;
+
+mod agent_loop {
+    pub(crate) use super::agent_loop_retry as retry;
+}
 
 use agents::{AgentFactory, AgentSpec};
 use bedrock::{bedrock_response_to_openai, openai_messages_to_bedrock};

@@ -18,6 +18,34 @@ fn max_agent_steps_default_to_100_and_preserve_custom_values() {
 }
 
 #[test]
+fn task_model_selection_validates_and_normalizes_reasoning_effort() {
+    let mut settings = default_settings();
+    settings.model = "deepseek-v4-flash".to_string();
+    settings.api_base_url = "https://api.deepseek.com/v1".to_string();
+
+    let selection = resolve_task_model_selection(
+        &settings,
+        Some(" deepseek-v4-flash "),
+        Some("max"),
+        None,
+        None,
+    )
+    .expect("DeepSeek V4 max effort should be accepted");
+    assert_eq!(selection.0, "deepseek-v4-flash");
+    assert_eq!(selection.1, Some(llm::ReasoningEffort::Max));
+
+    let error = resolve_task_model_selection(
+        &settings,
+        Some("deepseek-v4-flash"),
+        Some("low"),
+        None,
+        None,
+    )
+    .expect_err("DeepSeek V4 should reject OpenAI-only low effort");
+    assert!(error.contains("does not support"));
+}
+
+#[test]
 fn legacy_task_summaries_default_to_unarchived() {
     let summary: TaskSummary = serde_json::from_value(json!({
         "id": "task-1",
@@ -70,6 +98,8 @@ fn test_task(task_id: &str) -> Task {
         created_at: 1,
         updated_at: 1,
         demo_mode: false,
+        model: None,
+        reasoning_effort: None,
         archived: false,
         agent_name: default_agent_name(),
         agent_kind: default_agent_kind(),
@@ -90,6 +120,7 @@ fn test_task(task_id: &str) -> Task {
             attachments: Vec::new(),
         }],
         memory: Vec::new(),
+        context: Default::default(),
         plans: Vec::new(),
         active_plan_id: None,
         steps: Vec::new(),
@@ -101,6 +132,147 @@ fn test_task(task_id: &str) -> Task {
         event_seq: 0,
         persistence_revision: 1,
     }
+}
+
+fn test_context_event(kind: &str, compaction_id: &str, generation: u64) -> ContextEventRecord {
+    ContextEventRecord::new(
+        kind,
+        compaction_id,
+        generation,
+        Some("source-start".to_string()),
+        Some("source-end".to_string()),
+        "source-hash",
+        128,
+        64,
+        1,
+        json!({"status": kind}),
+    )
+}
+
+#[test]
+fn context_compaction_protocol_events_commit_with_the_surface_snapshot() {
+    let directory =
+        std::env::temp_dir().join(format!("rustpilot-context-protocol-{}", Uuid::new_v4()));
+    fs::create_dir_all(&directory).expect("test directory should be created");
+    let mut task = test_task("task-1");
+    task.context.generation = 1;
+    task.context.last_compaction_id = Some("compact-1".to_string());
+    task.context.surface_hash = "surface-hash".to_string();
+    task.persistence_revision = 2;
+    let durable = HashMap::from([("task-1".to_string(), test_task("task-1"))]);
+    let events = vec![
+        ("compaction_start", 0),
+        ("compaction_summary", 0),
+        ("surface_replace", 1),
+        ("compaction_end", 1),
+    ]
+    .into_iter()
+    .map(|(kind, generation)| PendingTaskEvent::Context {
+        revision: 2,
+        event: test_context_event(kind, "compact-1", generation),
+    })
+    .collect::<Vec<_>>();
+    let writes = PendingTaskWrites {
+        by_task: HashMap::from([(
+            "task-1".to_string(),
+            PendingTaskWrite::Upsert {
+                task: Box::new(task),
+                events,
+            },
+        )]),
+    };
+    let projected = project_task_writes(&durable, &HashMap::new(), &writes)
+        .expect("context write should project");
+    let connection =
+        open_task_database(&task_database_path(&directory)).expect("database should open");
+    let (connection, _, _, _, result) = commit_task_writes(connection, writes, projected);
+    result.expect("context protocol transaction should commit");
+
+    let event_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM context_event", [], |row| row.get(0))
+        .expect("context events should be queryable");
+    assert_eq!(event_count, 4);
+    let kinds = {
+        let mut statement = connection
+            .prepare("SELECT kind FROM context_event ORDER BY seq")
+            .expect("context event query should prepare");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("context events should load")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("context event kinds should decode")
+    };
+    assert_eq!(
+        kinds,
+        vec![
+            "compaction_start",
+            "compaction_summary",
+            "surface_replace",
+            "compaction_end"
+        ]
+    );
+
+    let loaded = load_task_store(&directory).expect("database should reopen");
+    assert_eq!(loaded.tasks["task-1"].context.generation, 1);
+    assert_eq!(
+        loaded.tasks["task-1"].context.last_compaction_id.as_deref(),
+        Some("compact-1")
+    );
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn interrupted_context_compaction_is_repaired_exactly_once() {
+    let directory =
+        std::env::temp_dir().join(format!("rustpilot-context-recovery-{}", Uuid::new_v4()));
+    fs::create_dir_all(&directory).expect("test directory should be created");
+    let task = test_task("task-1");
+    let mut connection =
+        open_task_database(&task_database_path(&directory)).expect("database should open");
+    let transaction = connection
+        .transaction()
+        .expect("database transaction should begin");
+    insert_task_state(&transaction, &task).expect("task should persist");
+    insert_context_event(
+        &transaction,
+        "task-1",
+        &test_context_event("compaction_start", "compact-1", 0),
+    )
+    .expect("start event should persist");
+    transaction
+        .commit()
+        .expect("database transaction should commit");
+
+    assert_eq!(
+        repair_interrupted_context_events(&mut connection).expect("context recovery should commit"),
+        1
+    );
+    assert_eq!(
+        repair_interrupted_context_events(&mut connection)
+            .expect("context recovery should be idempotent"),
+        0
+    );
+    let statuses = {
+        let mut statement = connection
+            .prepare("SELECT kind, payload FROM context_event ORDER BY seq")
+            .expect("context event query should prepare");
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("context events should load")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("context event rows should decode")
+    };
+    assert_eq!(statuses.len(), 2);
+    assert_eq!(statuses[1].0, "compaction_end");
+    assert_eq!(
+        serde_json::from_str::<Value>(&statuses[1].1).expect("recovery payload should be JSON")
+            ["status"],
+        "interrupted_recovery"
+    );
+
+    let _ = fs::remove_dir_all(directory);
 }
 
 #[test]
@@ -240,6 +412,75 @@ fn sqlite_replays_reasoning_stream_events_without_losing_order() {
 }
 
 #[test]
+fn sqlite_repairs_unclosed_agent_turns_exactly_once() {
+    let directory = std::env::temp_dir().join(format!("rustpilot-agent-events-{}", Uuid::new_v4()));
+    fs::create_dir_all(&directory).expect("test directory should be created");
+    let task = test_task("task-1");
+    let mut connection =
+        open_task_database(&task_database_path(&directory)).expect("task database should open");
+    let transaction = connection
+        .transaction()
+        .expect("agent event transaction should begin");
+    insert_task_state(&transaction, &task).expect("task snapshot should insert");
+    insert_agent_event(
+        &transaction,
+        "task-1",
+        1,
+        "turn-1",
+        1,
+        "turn_start",
+        1,
+        "{}",
+    )
+    .expect("turn start should insert");
+    insert_agent_event(
+        &transaction,
+        "task-1",
+        1,
+        "turn-1",
+        1,
+        "step_start",
+        2,
+        "{\"step\":1}",
+    )
+    .expect("step start should insert");
+    transaction
+        .commit()
+        .expect("agent event transaction should commit");
+
+    assert_eq!(
+        repair_interrupted_agent_events(&mut connection).expect("turn should be repaired"),
+        1
+    );
+    let kinds = {
+        let mut statement = connection
+            .prepare("SELECT kind FROM agent_event ORDER BY seq")
+            .expect("agent event query should prepare");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("agent event query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("agent event kinds should decode")
+    };
+    assert_eq!(
+        kinds,
+        vec![
+            "turn_start".to_string(),
+            "step_start".to_string(),
+            "step_end".to_string(),
+            "lifecycle_state".to_string(),
+            "turn_end".to_string()
+        ]
+    );
+    assert_eq!(
+        repair_interrupted_agent_events(&mut connection).expect("closed turn should stay closed"),
+        0
+    );
+
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
 fn task_event_pages_replay_after_a_cursor() {
     let directory =
         std::env::temp_dir().join(format!("rustpilot-task-event-pages-{}", Uuid::new_v4()));
@@ -344,15 +585,21 @@ fn stream_events_compact_back_into_the_task_snapshot() {
         std::env::temp_dir().join(format!("rustpilot-task-compaction-{}", Uuid::new_v4()));
     fs::create_dir_all(&directory).expect("test directory should be created");
     let task = test_task("task-1");
-    let events = (0..5000)
-        .map(|revision| PendingTaskEvent::Stream {
-            revision: revision + 2,
-            message_id: "task-1-message".to_string(),
-            event: PersistedStreamEvent::TextDelta {
-                delta: "x".to_string(),
-            },
-        })
-        .collect::<Vec<_>>();
+    let mut events = vec![PendingTaskEvent::Context {
+        revision: 2,
+        event: test_context_event("compaction_end", "compact-1", 1),
+    }];
+    events.extend(
+        (0..5000)
+            .map(|revision| PendingTaskEvent::Stream {
+                revision: revision + 2,
+                message_id: "task-1-message".to_string(),
+                event: PersistedStreamEvent::TextDelta {
+                    delta: "x".to_string(),
+                },
+            })
+            .collect::<Vec<_>>(),
+    );
     let writes = PendingTaskWrites {
         by_task: HashMap::from([("task-1".to_string(), PendingTaskWrite::Events { events })]),
     };
@@ -362,8 +609,12 @@ fn stream_events_compact_back_into_the_task_snapshot() {
     assert!(projected.compacted.contains("task-1"));
     let connection =
         open_task_database(&task_database_path(&directory)).expect("task database should open");
-    let (_, _, _, _, result) = commit_task_writes(connection, writes, projected);
+    let (connection, _, _, _, result) = commit_task_writes(connection, writes, projected);
     result.expect("compaction transaction should commit");
+    let context_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM context_event", [], |row| row.get(0))
+        .expect("context events should survive task event compaction");
+    assert_eq!(context_count, 1);
     let loaded = load_task_store(&directory).expect("compacted database should reopen");
     assert_eq!(loaded.tasks["task-1"].messages[0].content.len(), 5000);
     assert_eq!(loaded.event_bytes.get("task-1").copied(), Some(0));
@@ -1168,6 +1419,43 @@ fn context_budget_keeps_assistant_and_tool_messages_together() {
     );
     validate_chat_message_context(&memory_to_chat_messages(&entries))
         .expect("bounded history should remain protocol-valid");
+}
+
+#[test]
+fn context_overflow_recovery_only_matches_provider_size_errors() {
+    assert!(is_context_overflow_message(
+        "400: maximum context length is 128000 tokens"
+    ));
+    assert!(is_context_overflow_message(
+        "input is too long for this model"
+    ));
+    assert!(!is_context_overflow_message("the provider timed out"));
+    assert!(!is_context_overflow_message(
+        "tool output exceeded its local limit"
+    ));
+}
+
+#[test]
+fn model_surface_is_not_truncated_by_a_legacy_entry_count() {
+    let entries = (0..512)
+        .map(|index| AgentMemoryEntry {
+            id: format!("memory-{index}"),
+            role: "user".to_string(),
+            content: format!("历史事实 {index}"),
+            reasoning: String::new(),
+            reasoning_opaque: None,
+            created_at: index,
+            tool_call_id: None,
+            tool_names: Vec::new(),
+            tool_calls: Vec::new(),
+            name: None,
+            base64_image: None,
+            attachments: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let (normalized, changed) = normalize_memory_for_context(&entries);
+    assert!(!changed);
+    assert_eq!(normalized.len(), entries.len());
 }
 
 #[tokio::test]

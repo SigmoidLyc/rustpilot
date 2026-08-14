@@ -17,6 +17,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub mod agent;
+pub(crate) mod agent_loop;
 pub mod agents;
 pub mod attachments;
 pub mod bedrock;
@@ -25,6 +26,7 @@ pub mod config;
 pub mod flow;
 pub mod llm;
 pub mod mcp_server;
+pub(crate) mod model_catalog;
 pub mod path_guard;
 pub mod protocol;
 pub mod react;
@@ -58,8 +60,8 @@ use browser_tool::{run_browser_tool, run_crawl_tool, run_web_search_tool};
 #[cfg(test)]
 use models::default_agent_kind;
 use models::{
-    default_agent_name, BrowserSession, BrowserTab, PersistedSettings, PersistentShell,
-    ToolInvocation,
+    default_agent_name, BrowserSession, BrowserTab, ContextState, PersistedSettings,
+    PersistentShell, ToolInvocation,
 };
 pub use models::{
     AgentMemoryEntry, AgentPlan, AgentPlanStep, AgentSettings, AgentStatus, AgentStep,
@@ -133,6 +135,7 @@ pub(crate) fn ensure_writable_directory(
     }
 }
 
+use agent_loop::provenance::ContextEventRecord;
 #[cfg(test)]
 use task_events::{apply_persisted_stream_event, PersistedStreamEvent};
 pub use task_events::{TaskEvent, TaskEventPage};
@@ -144,10 +147,14 @@ use task_persistence::{
 use task_persistence::{PendingTaskEvent, TaskPersistence};
 #[cfg(test)]
 use task_storage::{
-    insert_task_state, legacy_task_backup_path, legacy_task_temp_path, load_legacy_task_records,
-    open_task_database, task_database_path, LEGACY_TASK_FILE,
+    insert_agent_event, insert_context_event, insert_task_state, legacy_task_backup_path,
+    legacy_task_temp_path, load_legacy_task_records, open_task_database, task_database_path,
+    LEGACY_TASK_FILE,
 };
-use task_storage::{load_task_store, LoadedTaskStore};
+use task_storage::{
+    load_task_store, repair_interrupted_agent_events, repair_interrupted_context_events,
+    LoadedTaskStore,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -287,8 +294,22 @@ impl AppState {
             event_bytes,
             event_cursors,
             event_floors,
-            connection,
+            mut connection,
         } = load_task_store(&data_dir)?;
+        let repaired_context_compactions = repair_interrupted_context_events(&mut connection)?;
+        if repaired_context_compactions > 0 {
+            info!(
+                compactions = repaired_context_compactions,
+                "Repaired interrupted context compactions"
+            );
+        }
+        let repaired_agent_turns = repair_interrupted_agent_events(&mut connection)?;
+        if repaired_agent_turns > 0 {
+            info!(
+                turns = repaired_agent_turns,
+                "Repaired interrupted agent lifecycle turns"
+            );
+        }
         {
             let mut cursors = self
                 .event_cursors
@@ -411,6 +432,209 @@ impl AppState {
             .enqueue_task_event(task_id, revision, event.to_string(), payload)
     }
 
+    pub(crate) fn persist_agent_event(
+        &self,
+        task_id: &str,
+        turn_id: String,
+        step: u32,
+        kind: String,
+        occurred_at: i64,
+        payload: Value,
+    ) -> Result<(), String> {
+        let revision = self
+            .tasks
+            .read()
+            .map_err(|_| "Task lock is poisoned".to_string())?
+            .get(task_id)
+            .map(|task| task.persistence_revision)
+            .ok_or_else(|| "Task not found".to_string())?;
+        self.task_persistence.enqueue_agent_event(
+            task_id,
+            revision,
+            turn_id,
+            step,
+            kind,
+            occurred_at,
+            payload,
+        )
+    }
+
+    pub(crate) async fn checkpoint_persistence(&self) -> Result<(), String> {
+        self.task_persistence.flush().await
+    }
+
+    pub(crate) fn persist_context_event(
+        &self,
+        task_id: &str,
+        event: ContextEventRecord,
+    ) -> Result<(), String> {
+        let revision = self
+            .tasks
+            .read()
+            .map_err(|_| "Task lock is poisoned".to_string())?
+            .get(task_id)
+            .map(|task| task.persistence_revision)
+            .ok_or_else(|| "Task not found".to_string())?;
+        self.task_persistence
+            .enqueue_context_event(task_id, revision, event)
+    }
+
+    pub(crate) fn begin_context_compaction(
+        &self,
+        task_id: &str,
+        compaction_id: &str,
+        mut start_event: ContextEventRecord,
+    ) -> Result<u64, String> {
+        let (generation, task) = {
+            let mut tasks = self
+                .tasks
+                .write()
+                .map_err(|_| "Task lock is poisoned".to_string())?;
+            let task = tasks
+                .get_mut(task_id)
+                .ok_or_else(|| "Task not found".to_string())?;
+            if let Some(active) = task.context.active_compaction_id.as_deref() {
+                return Err(format!(
+                    "Context compaction is already active for task {task_id} ({active})."
+                ));
+            }
+            task.context.active_compaction_id = Some(compaction_id.to_string());
+            touch_task(task);
+            (task.context.generation, task.clone())
+        };
+        if start_event.compaction_id != compaction_id {
+            let _ = self.abort_context_compaction(task_id, compaction_id);
+            return Err("Context compaction start event id does not match the lock.".to_string());
+        }
+        start_event.generation = generation;
+        let event = PendingTaskEvent::Context {
+            revision: task.persistence_revision,
+            event: start_event,
+        };
+        if let Err(error) = self
+            .task_persistence
+            .enqueue_upsert_with_events(task, vec![event])
+        {
+            let _ = self.abort_context_compaction(task_id, compaction_id);
+            return Err(error);
+        }
+        Ok(generation)
+    }
+
+    pub(crate) fn abort_context_compaction(
+        &self,
+        task_id: &str,
+        compaction_id: &str,
+    ) -> Result<(), String> {
+        let changed = {
+            let mut tasks = self
+                .tasks
+                .write()
+                .map_err(|_| "Task lock is poisoned".to_string())?;
+            let task = tasks
+                .get_mut(task_id)
+                .ok_or_else(|| "Task not found".to_string())?;
+            if task.context.active_compaction_id.as_deref() != Some(compaction_id) {
+                false
+            } else {
+                task.context.active_compaction_id = None;
+                touch_task(task);
+                true
+            }
+        };
+        if changed {
+            self.persist_task(task_id)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_context_surface(
+        &self,
+        task_id: &str,
+        compaction_id: &str,
+        generation: u64,
+        expected_surface_hash: &str,
+        entries: Vec<AgentMemoryEntry>,
+        surface_hash: String,
+        events: Vec<ContextEventRecord>,
+    ) -> Result<u64, String> {
+        let (next_generation, task) = {
+            let mut tasks = self
+                .tasks
+                .write()
+                .map_err(|_| "Task lock is poisoned".to_string())?;
+            let task = tasks
+                .get_mut(task_id)
+                .ok_or_else(|| "Task not found".to_string())?;
+            if task.context.active_compaction_id.as_deref() != Some(compaction_id) {
+                return Err(
+                    "Context compaction lock is no longer owned by this operation.".to_string(),
+                );
+            }
+            if task.context.generation != generation {
+                return Err("Context surface changed while compaction was running.".to_string());
+            }
+            if !expected_surface_hash.is_empty()
+                && agent_loop::surface::surface_hash(&task.memory) != expected_surface_hash
+            {
+                return Err(
+                    "Context surface provenance no longer matches the compaction span.".to_string(),
+                );
+            }
+            task.memory = entries;
+            task.context.generation = generation.saturating_add(1);
+            task.context.active_compaction_id = None;
+            task.context.last_compaction_id = Some(compaction_id.to_string());
+            task.context.surface_hash = surface_hash;
+            touch_task(task);
+            (task.context.generation, task.clone())
+        };
+        let revision = task.persistence_revision;
+        let pending_events = events
+            .into_iter()
+            .map(|event| PendingTaskEvent::Context { revision, event })
+            .collect();
+        self.task_persistence
+            .enqueue_upsert_with_events(task, pending_events)?;
+        Ok(next_generation)
+    }
+
+    pub(crate) fn replace_context_surface(
+        &self,
+        task_id: &str,
+        entries: Vec<AgentMemoryEntry>,
+        surface_hash: String,
+        event: Option<ContextEventRecord>,
+    ) -> Result<(), String> {
+        let task = {
+            let mut tasks = self
+                .tasks
+                .write()
+                .map_err(|_| "Task lock is poisoned".to_string())?;
+            let task = tasks
+                .get_mut(task_id)
+                .ok_or_else(|| "Task not found".to_string())?;
+            if task.context.active_compaction_id.is_some() {
+                return Err("Cannot replace the context surface during compaction.".to_string());
+            }
+            task.memory = entries;
+            task.context.generation = task.context.generation.saturating_add(1);
+            task.context.surface_hash = surface_hash;
+            touch_task(task);
+            task.clone()
+        };
+        let revision = task.persistence_revision;
+        let events = event
+            .into_iter()
+            .map(|mut event| {
+                event.generation = task.context.generation;
+                PendingTaskEvent::Context { revision, event }
+            })
+            .collect();
+        self.task_persistence
+            .enqueue_upsert_with_events(task, events)
+    }
+
     fn persist_deleted_task(
         &self,
         task_id: &str,
@@ -510,6 +734,7 @@ fn default_settings() -> AgentSettings {
         max_steps: agent::DEFAULT_MAX_AGENT_STEPS,
         timeout_secs: 45,
         prompt_cache: llm::PromptCacheMode::Auto,
+        reasoning_effort: None,
         approval_mode: ApprovalMode::Guarded,
         approval_rules: Vec::new(),
     }
@@ -517,6 +742,38 @@ fn default_settings() -> AgentSettings {
 
 fn normalize_max_steps(max_steps: u32) -> u32 {
     max_steps.max(1)
+}
+
+fn resolve_task_model_selection(
+    settings: &AgentSettings,
+    requested_model: Option<&str>,
+    requested_effort: Option<&str>,
+    fallback_model: Option<&str>,
+    fallback_effort: Option<llm::ReasoningEffort>,
+) -> Result<(String, Option<llm::ReasoningEffort>), String> {
+    let model = requested_model
+        .or(fallback_model)
+        .unwrap_or(&settings.model)
+        .trim();
+    let model = if model.is_empty() {
+        return Err("Model name cannot be empty.".to_string());
+    } else {
+        model.to_string()
+    };
+
+    let effort = match requested_effort.map(str::trim) {
+        Some(value) if value.is_empty() || value.eq_ignore_ascii_case("default") => None,
+        Some(value) if value.eq_ignore_ascii_case("auto") => None,
+        Some(value) => Some(
+            llm::ReasoningEffort::parse(value)
+                .ok_or_else(|| format!("Unsupported reasoning effort `{value}`."))?,
+        ),
+        None => fallback_effort,
+    };
+    if let Some(effort) = effort {
+        llm::validate_reasoning_effort(&model, &settings.api_base_url, effort)?;
+    }
+    Ok((model, effort))
 }
 
 fn first_env_value(names: &[&str]) -> Option<String> {
@@ -542,6 +799,10 @@ fn mark_task_revision(task: &mut Task) {
 fn touch_task(task: &mut Task) {
     mark_task_revision(task);
     task.updated_at = now();
+}
+
+fn invalidate_context_surface_hash(task: &mut Task) {
+    task.context.surface_hash.clear();
 }
 
 fn new_id(prefix: &str) -> String {
@@ -830,6 +1091,7 @@ fn normalize_memory_entries(entries: &[AgentMemoryEntry]) -> (Vec<AgentMemoryEnt
     (normalized, changed)
 }
 
+#[cfg(test)]
 fn split_memory_turns(entries: &[AgentMemoryEntry]) -> Vec<Vec<AgentMemoryEntry>> {
     let mut turns = Vec::new();
     let mut current = Vec::new();
@@ -845,6 +1107,7 @@ fn split_memory_turns(entries: &[AgentMemoryEntry]) -> Vec<Vec<AgentMemoryEntry>
     turns
 }
 
+#[cfg(test)]
 fn reduce_latest_turn(turn: &[AgentMemoryEntry], max_entries: usize) -> Vec<AgentMemoryEntry> {
     if turn.len() <= max_entries {
         return turn.to_vec();
@@ -887,6 +1150,7 @@ fn reduce_latest_turn(turn: &[AgentMemoryEntry], max_entries: usize) -> Vec<Agen
     result
 }
 
+#[cfg(test)]
 fn trim_memory_to_budget(entries: &mut Vec<AgentMemoryEntry>, max_entries: usize) {
     if max_entries == 0 {
         entries.clear();
@@ -915,13 +1179,7 @@ fn trim_memory_to_budget(entries: &mut Vec<AgentMemoryEntry>, max_entries: usize
 }
 
 fn normalize_memory_for_context(entries: &[AgentMemoryEntry]) -> (Vec<AgentMemoryEntry>, bool) {
-    let (normalized, mut changed) = normalize_memory_entries(entries);
-    let mut bounded = normalized.clone();
-    trim_memory_to_budget(&mut bounded, MAX_MEMORY_ENTRIES);
-    if bounded != normalized {
-        changed = true;
-    }
-    (bounded, changed)
+    normalize_memory_entries(entries)
 }
 
 fn recovered_tool_result_count(entries: &[AgentMemoryEntry]) -> usize {
@@ -949,6 +1207,9 @@ fn clear_streaming_message_flags(messages: &mut [TaskMessage]) -> bool {
 
 fn repair_task_record(task: &mut Task) -> bool {
     let mut changed = clear_streaming_message_flags(&mut task.messages);
+    if task.context.active_compaction_id.take().is_some() {
+        changed = true;
+    }
     let workspace = normalized_task_workspace(&task.workspace);
     if task.workspace != workspace {
         task.workspace = workspace;
@@ -1081,7 +1342,15 @@ fn repair_task_memory(state: &AppState, task_id: &str) -> Result<Vec<AgentMemory
         let task = tasks
             .get_mut(task_id)
             .ok_or_else(|| "Task not found".to_string())?;
-        let changed = repair_task_record(task);
+        let mut changed = repair_task_record(task);
+        if task.context.surface_hash.is_empty() || changed {
+            let surface_hash = agent_loop::surface::surface_hash(&task.memory);
+            if task.context.surface_hash != surface_hash {
+                task.context.surface_hash = surface_hash;
+                touch_task(task);
+                changed = true;
+            }
+        }
         (task.memory.clone(), changed)
     };
     if changed {
@@ -1151,7 +1420,7 @@ fn record_memory_full(state: &AppState, task_id: &str, record: MemoryRecord) -> 
         base64_image: record.base64_image,
         attachments: record.attachments,
     });
-    trim_memory_to_budget(&mut task.memory, MAX_MEMORY_ENTRIES);
+    invalidate_context_surface_hash(task);
     touch_task(task);
     drop(tasks);
     state.persist_task(task_id)
@@ -3235,6 +3504,7 @@ fn llm_settings_for_task(
         base_url: settings.api_base_url.clone(),
         api_key: settings.api_key.clone().unwrap_or_default(),
         prompt_cache: settings.prompt_cache,
+        reasoning_effort: settings.reasoning_effort,
         ..llm::LlmSettings::default()
     };
     llm_settings.session_id = Some(format!("rustpilot:{task_id}"));
@@ -3270,23 +3540,448 @@ fn record_task_llm_usage(
     state.persist_task(task_id)
 }
 
+fn context_system_values(system_messages: &[ChatMessage]) -> Vec<Value> {
+    system_messages
+        .iter()
+        .filter_map(|message| serde_json::to_value(message).ok())
+        .collect()
+}
+
+fn context_request_values(
+    system_messages: &[ChatMessage],
+    memory: &[AgentMemoryEntry],
+    data_dir: &Path,
+    supports_images: bool,
+    tools: &[Value],
+) -> Result<(Vec<Value>, usize), String> {
+    let mut values = system_messages
+        .iter()
+        .map(|message| chat_message_value(message, data_dir, supports_images))
+        .collect::<Result<Vec<_>, _>>()?;
+    values.extend(
+        memory_to_chat_messages(memory)
+            .iter()
+            .map(|message| chat_message_value(message, data_dir, supports_images))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    let mut sanitized = values;
+    llm::sanitize_openai_messages_for_provider(&mut sanitized, false, false);
+    let tokens = agent_loop::context::total_tokens(&sanitized, tools);
+    Ok((sanitized, tokens))
+}
+
+fn context_event(
+    kind: &str,
+    compaction_id: &str,
+    generation: u64,
+    source_start: Option<String>,
+    source_end: Option<String>,
+    source_hash: String,
+    shadowed_tokens: usize,
+    surface_tokens: usize,
+    payload: Value,
+) -> ContextEventRecord {
+    ContextEventRecord::new(
+        kind,
+        compaction_id,
+        generation,
+        source_start,
+        source_end,
+        source_hash,
+        shadowed_tokens,
+        surface_tokens,
+        now(),
+        payload,
+    )
+}
+
+async fn close_failed_context_compaction(
+    state: &AppState,
+    task_id: &str,
+    plan: &agent_loop::surface::CompactionPlan,
+    generation: u64,
+    status: &str,
+    reason: Option<String>,
+    original: AgentError,
+) -> AgentError {
+    if let Err(error) = state.abort_context_compaction(task_id, &plan.compaction_id) {
+        warn!(
+            task_id = %task_id,
+            compaction_id = %plan.compaction_id,
+            error = %error,
+            "Unable to clear failed context compaction lock"
+        );
+    }
+    let mut payload = json!({ "status": status });
+    if let Some(reason) = reason {
+        payload["error"] = Value::String(reason);
+    }
+    if let Err(error) = state.persist_context_event(
+        task_id,
+        context_event(
+            "compaction_end",
+            &plan.compaction_id,
+            generation,
+            plan.source_start.clone(),
+            plan.source_end.clone(),
+            plan.source_hash.clone(),
+            plan.shadowed_tokens,
+            plan.tail_tokens,
+            payload,
+        ),
+    ) {
+        warn!(
+            task_id = %task_id,
+            compaction_id = %plan.compaction_id,
+            error = %error,
+            "Unable to queue failed context compaction end event"
+        );
+    }
+    if let Err(error) = state.checkpoint_persistence().await {
+        warn!(
+            task_id = %task_id,
+            compaction_id = %plan.compaction_id,
+            error = %error,
+            "Unable to checkpoint failed context compaction recovery"
+        );
+    }
+    original
+}
+
+fn is_context_overflow_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "context length",
+        "context_length",
+        "maximum context",
+        "max context",
+        "too many tokens",
+        "prompt is too long",
+        "input is too long",
+        "token limit",
+        "context window",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
+}
+
+async fn prepare_task_context(
+    state: &AppState,
+    task_id: &str,
+    settings: &AgentSettings,
+    system_messages: &[ChatMessage],
+    client: &llm::OpenAiCompatibleClient,
+    tools: &tool_registry::ToolDefinitionSnapshot,
+    cancel: &CancellationToken,
+    lifecycle: &mut agent_loop::events::AgentLifecycle,
+    force: bool,
+) -> Result<Vec<ChatMessage>, AgentError> {
+    let task = task_snapshot(state, task_id).map_err(AgentError::Message)?;
+    let memory = repair_task_memory(state, task_id).map_err(AgentError::Message)?;
+    let data_dir = state
+        .storage_dir
+        .read()
+        .map_err(|_| AgentError::Message("Storage lock is poisoned".to_string()))?
+        .clone()
+        .ok_or_else(|| AgentError::Message("Attachment storage is not initialized.".to_string()))?;
+    let budget =
+        agent_loop::context::ContextBudget::for_model(&settings.model, &settings.api_base_url);
+    let (_, actual_before) = context_request_values(
+        system_messages,
+        &memory,
+        &data_dir,
+        client.supports_images(),
+        tools.definitions.as_slice(),
+    )
+    .map_err(AgentError::Message)?;
+    if !force && actual_before <= budget.pressure_limit() {
+        let mut messages = system_messages.to_vec();
+        messages.extend(memory_to_chat_messages(&memory));
+        return Ok(messages);
+    }
+
+    let mut working = memory.clone();
+    if !force {
+        if let Some(pruned) = agent_loop::compaction::prepare_prune(&working, budget) {
+            let surface_hash = agent_loop::surface::surface_hash(&pruned.entries);
+            let (source_start, source_end) = agent_loop::surface::source_span(&working);
+            let prune_id = format!("tool-prune-{}", Uuid::new_v4());
+            let prune_event = context_event(
+                "tool_prune",
+                &prune_id,
+                task.context.generation,
+                source_start,
+                source_end,
+                agent_loop::surface::surface_hash(&working),
+                pruned.before_tokens.saturating_sub(pruned.after_tokens),
+                pruned.after_tokens,
+                json!({
+                    "status": "complete",
+                    "changed_ids": pruned.changed_ids,
+                }),
+            );
+            state
+                .replace_context_surface(
+                    task_id,
+                    pruned.entries.clone(),
+                    surface_hash.clone(),
+                    Some(prune_event),
+                )
+                .map_err(AgentError::Message)?;
+            lifecycle
+                .context_compaction(
+                    pruned.before_tokens,
+                    pruned.after_tokens,
+                    pruned.changed_ids.len(),
+                )
+                .await
+                .map_err(AgentError::Message)?;
+            state
+                .checkpoint_persistence()
+                .await
+                .map_err(AgentError::Message)?;
+            working = pruned.entries;
+            let mut messages = system_messages.to_vec();
+            messages.extend(memory_to_chat_messages(&working));
+            return Ok(messages);
+        }
+    }
+
+    let plan = agent_loop::compaction::build_plan(&working, budget);
+    let Some(plan) = plan else {
+        let fallback = agent_loop::compaction::fallback_surface(&working, budget);
+        if fallback.entries != working {
+            let surface_hash = agent_loop::surface::surface_hash(&fallback.entries);
+            let prune_event = context_event(
+                "tool_prune",
+                &format!("tool-prune-{}", Uuid::new_v4()),
+                task.context.generation,
+                None,
+                None,
+                agent_loop::surface::surface_hash(&working),
+                fallback.before_tokens.saturating_sub(fallback.after_tokens),
+                fallback.after_tokens,
+                json!({"status":"fallback"}),
+            );
+            state
+                .replace_context_surface(
+                    task_id,
+                    fallback.entries.clone(),
+                    surface_hash.clone(),
+                    Some(prune_event),
+                )
+                .map_err(AgentError::Message)?;
+            state
+                .checkpoint_persistence()
+                .await
+                .map_err(AgentError::Message)?;
+            working = fallback.entries;
+        }
+        let mut messages = system_messages.to_vec();
+        messages.extend(memory_to_chat_messages(&working));
+        return Ok(messages);
+    };
+
+    let start_event = context_event(
+        "compaction_start",
+        &plan.compaction_id,
+        0,
+        plan.source_start.clone(),
+        plan.source_end.clone(),
+        plan.source_hash.clone(),
+        plan.shadowed_tokens,
+        plan.tail_tokens,
+        json!({
+            "status": "started",
+            "source_count": plan.source_entries.len(),
+            "tail_count": plan.tail_entries.len(),
+            "forced": force,
+        }),
+    );
+    let generation = state
+        .begin_context_compaction(task_id, &plan.compaction_id, start_event)
+        .map_err(AgentError::Message)?;
+    if let Err(error) = state.checkpoint_persistence().await {
+        return Err(close_failed_context_compaction(
+            state,
+            task_id,
+            &plan,
+            generation,
+            "error",
+            Some(error.clone()),
+            AgentError::Message(error),
+        )
+        .await);
+    }
+
+    let system_values = context_system_values(system_messages);
+    let prepared = agent_loop::compaction::finish_plan(
+        plan.clone(),
+        &system_values,
+        budget,
+        |summary_messages| async move {
+            let completion = tokio::select! {
+                _ = cancel.cancelled() => return Err(agent_loop::compaction::SummaryFailure::Cancelled),
+                result = client.complete(
+                    &summary_messages,
+                    &[],
+                    agent::ToolChoice::None,
+                    Some(0.0),
+                    cancel,
+                ) => match result {
+                    Ok(completion) => completion,
+                    Err(llm::LlmError::Cancelled) => {
+                        return Err(agent_loop::compaction::SummaryFailure::Cancelled)
+                    }
+                    Err(error) => {
+                        return Err(agent_loop::compaction::SummaryFailure::Unavailable(error.to_string()))
+                    }
+                },
+            };
+            let content = completion.content.trim().to_string();
+            if let Err(error) = record_task_llm_usage(
+                state,
+                task_id,
+                &completion,
+                llm::TokenCounter::count_messages(&summary_messages),
+            ) {
+                warn!(task_id = %task_id, error = %error, "Unable to persist context summary usage");
+            }
+            if content.is_empty() {
+                Err(agent_loop::compaction::SummaryFailure::Unavailable(
+                    "The summary provider returned no text.".to_string(),
+                ))
+            } else {
+                Ok(content)
+            }
+        },
+    )
+    .await;
+
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(agent_loop::compaction::SummaryFailure::Cancelled) => {
+            return Err(close_failed_context_compaction(
+                state,
+                task_id,
+                &plan,
+                generation,
+                "cancelled",
+                None,
+                AgentError::Cancelled,
+            )
+            .await);
+        }
+        Err(agent_loop::compaction::SummaryFailure::Unavailable(error)) => {
+            return Err(close_failed_context_compaction(
+                state,
+                task_id,
+                &plan,
+                generation,
+                "error",
+                Some(error.clone()),
+                AgentError::Message(error),
+            )
+            .await);
+        }
+    };
+    let summary = prepared.summary.clone().unwrap_or_default();
+    let surface_hash = agent_loop::surface::surface_hash(&prepared.entries);
+    let summary_hash = agent_loop::events::stable_hash_hex(summary.as_bytes());
+    let next_generation = generation.saturating_add(1);
+    let completion_events = vec![
+        context_event(
+            "compaction_summary",
+            &plan.compaction_id,
+            generation,
+            plan.source_start.clone(),
+            plan.source_end.clone(),
+            plan.source_hash.clone(),
+            plan.shadowed_tokens,
+            prepared.after_tokens,
+            json!({
+                "summary_hash": summary_hash,
+                "summary": summary,
+                "fallback": prepared.summary_fallback,
+            }),
+        ),
+        context_event(
+            "surface_replace",
+            &plan.compaction_id,
+            next_generation,
+            plan.source_start.clone(),
+            plan.source_end.clone(),
+            plan.source_hash.clone(),
+            plan.shadowed_tokens,
+            prepared.after_tokens,
+            json!({
+                "surface_hash": surface_hash.clone(),
+                "new_message_count": prepared.entries.len(),
+                "pruned_ids": prepared.changed_ids,
+            }),
+        ),
+        context_event(
+            "compaction_end",
+            &plan.compaction_id,
+            next_generation,
+            plan.source_start.clone(),
+            plan.source_end.clone(),
+            plan.source_hash.clone(),
+            plan.shadowed_tokens,
+            prepared.after_tokens,
+            json!({"status":"complete"}),
+        ),
+    ];
+    if let Err(error) = state.commit_context_surface(
+        task_id,
+        &plan.compaction_id,
+        generation,
+        &plan.expected_surface_hash,
+        prepared.entries.clone(),
+        surface_hash,
+        completion_events,
+    ) {
+        return Err(close_failed_context_compaction(
+            state,
+            task_id,
+            &plan,
+            generation,
+            "error",
+            Some(error.clone()),
+            AgentError::Message(error),
+        )
+        .await);
+    }
+    lifecycle
+        .context_compaction(
+            plan.before_tokens,
+            prepared.after_tokens,
+            plan.source_entries.len(),
+        )
+        .await
+        .map_err(AgentError::Message)?;
+    state
+        .checkpoint_persistence()
+        .await
+        .map_err(AgentError::Message)?;
+    working = prepared.entries;
+    let mut messages = system_messages.to_vec();
+    messages.extend(memory_to_chat_messages(&working));
+    Ok(messages)
+}
+
 async fn stream_openai(
     app: &AppHandle,
     state: &AppState,
     task_id: &str,
     settings: &AgentSettings,
-    agent_spec: &agents::AgentSpec,
     messages: &[ChatMessage],
+    client: &llm::OpenAiCompatibleClient,
+    tools: &tool_registry::ToolDefinitionSnapshot,
     cancel: &CancellationToken,
+    lifecycle: &mut agent_loop::events::AgentLifecycle,
 ) -> Result<Completion, AgentError> {
     validate_chat_message_context(messages).map_err(AgentError::Message)?;
-    let tools = tool_definitions_for_agent(state, agent_spec);
-    let client = llm::OpenAiCompatibleClient::new(llm_settings_for_task(
-        settings,
-        task_id,
-        Some(tools.schema_hash.as_ref()),
-    ))
-    .map_err(|error| AgentError::Message(error.to_string()))?;
     let data_dir = state
         .storage_dir
         .read()
@@ -3304,12 +3999,65 @@ async fn stream_openai(
         copilot_reasoning,
         client.uses_strict_assistant_history(),
     );
+    let context_budget =
+        agent_loop::context::ContextBudget::for_model(&settings.model, &settings.api_base_url);
+    let context_report = agent_loop::context::fit_openai_messages(
+        &mut request_messages,
+        tools.definitions.as_slice(),
+        context_budget,
+    )
+    .map_err(AgentError::Message)?;
+    if context_report.compacted || context_report.dropped_messages > 0 {
+        lifecycle
+            .context_compaction(
+                context_report.before_tokens,
+                context_report.after_tokens,
+                context_report.dropped_messages,
+            )
+            .await
+            .map_err(AgentError::Message)?;
+    }
+    let system_hash = agent_loop::events::stable_hash_hex(
+        &serde_json::to_vec(
+            &request_messages
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_default(),
+    );
+    lifecycle
+        .request_header(
+            &settings.model,
+            &settings.api_base_url,
+            settings
+                .reasoning_effort
+                .map(|effort| effort.as_str().to_string()),
+            context_budget.window,
+            context_report.after_tokens,
+            request_messages.len(),
+            tools.schema_hash.as_ref(),
+            &system_hash,
+        )
+        .await
+        .map_err(AgentError::Message)?;
     // Publish the assistant turn before waiting for the first token so the UI can show progress.
     let message = add_message(app, state, task_id, "assistant", String::new(), true)
         .map_err(AgentError::Message)?;
     let message_id = message.id;
+    let mut on_retry = |attempt: usize, error: &llm::LlmError, delay: Duration| {
+        if let Err(persist_error) =
+            lifecycle.retry_scheduled_sync(attempt, delay.as_millis() as u64, &error.to_string())
+        {
+            warn!(
+                task_id = %task_id,
+                error = %persist_error,
+                "Unable to persist LLM retry event"
+            );
+        }
+    };
     let completion = match client
-        .stream(
+        .stream_with_retry_observer(
             &request_messages,
             tools.definitions.as_slice(),
             agent::ToolChoice::Auto,
@@ -3319,6 +4067,7 @@ async fn stream_openai(
                 append_stream_event(app, state, task_id, &message_id, event)
                     .map_err(llm::LlmError::InvalidInput)
             },
+            &mut on_retry,
         )
         .await
     {
@@ -3345,6 +4094,15 @@ async fn stream_openai(
                 .sum::<usize>(),
     )
     .map_err(AgentError::Message)?;
+    lifecycle
+        .assistant_message(
+            &message_id,
+            completion.content.chars().count(),
+            completion.reasoning.chars().count(),
+            completion.tool_calls.len(),
+        )
+        .await
+        .map_err(AgentError::Message)?;
     Ok(Completion {
         message_id,
         content: completion.content,
@@ -3365,6 +4123,207 @@ async fn stream_openai(
     })
 }
 
+fn reorder_tool_batch_records(
+    state: &AppState,
+    task_id: &str,
+    call_ids: &[String],
+) -> Result<(), String> {
+    if call_ids.len() < 2 {
+        return Ok(());
+    }
+    let wanted = call_ids.iter().cloned().collect::<HashSet<_>>();
+    let mut tasks = state
+        .tasks
+        .write()
+        .map_err(|_| "Task lock is poisoned".to_string())?;
+    let task = tasks
+        .get_mut(task_id)
+        .ok_or_else(|| "Task not found".to_string())?;
+    let mut changed = false;
+
+    let memory_positions = task
+        .memory
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            entry
+                .tool_call_id
+                .as_deref()
+                .filter(|call_id| wanted.contains(*call_id))
+                .map(|_| index)
+        })
+        .collect::<Vec<_>>();
+    let memory_by_id = task
+        .memory
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .tool_call_id
+                .as_deref()
+                .filter(|call_id| wanted.contains(*call_id))
+                .map(|call_id| (call_id.to_string(), entry.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let ordered_memory = call_ids
+        .iter()
+        .filter_map(|call_id| memory_by_id.get(call_id).cloned())
+        .collect::<Vec<_>>();
+    if ordered_memory.len() == memory_positions.len() {
+        for (position, entry) in memory_positions.into_iter().zip(ordered_memory) {
+            if task.memory[position] != entry {
+                task.memory[position] = entry;
+                changed = true;
+            }
+        }
+    }
+
+    let message_positions = task
+        .messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            message
+                .tool_call_id
+                .as_deref()
+                .filter(|call_id| wanted.contains(*call_id))
+                .map(|_| index)
+        })
+        .collect::<Vec<_>>();
+    let messages_by_id = task
+        .messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .tool_call_id
+                .as_deref()
+                .filter(|call_id| wanted.contains(*call_id))
+                .map(|call_id| (call_id.to_string(), message.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let ordered_messages = call_ids
+        .iter()
+        .filter_map(|call_id| messages_by_id.get(call_id).cloned())
+        .collect::<Vec<_>>();
+    if ordered_messages.len() == message_positions.len() {
+        for (position, message) in message_positions.into_iter().zip(ordered_messages) {
+            if task.messages[position].id != message.id {
+                task.messages[position] = message;
+                changed = true;
+            }
+        }
+    }
+
+    let tool_positions = task
+        .tool_calls
+        .iter()
+        .enumerate()
+        .filter_map(|(index, call)| {
+            call.model_tool_call_id
+                .as_deref()
+                .filter(|call_id| wanted.contains(*call_id))
+                .map(|_| index)
+        })
+        .collect::<Vec<_>>();
+    let tools_by_id = task
+        .tool_calls
+        .iter()
+        .filter_map(|call| {
+            call.model_tool_call_id
+                .as_deref()
+                .filter(|call_id| wanted.contains(*call_id))
+                .map(|call_id| (call_id.to_string(), call.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let ordered_tools = call_ids
+        .iter()
+        .filter_map(|call_id| tools_by_id.get(call_id).cloned())
+        .collect::<Vec<_>>();
+    if ordered_tools.len() == tool_positions.len() {
+        for (position, tool) in tool_positions.into_iter().zip(ordered_tools) {
+            if task.tool_calls[position].id != tool.id {
+                task.tool_calls[position] = tool;
+                changed = true;
+            }
+        }
+    }
+
+    if changed {
+        invalidate_context_surface_hash(task);
+        touch_task(task);
+    }
+    drop(tasks);
+    if changed {
+        state.persist_task(task_id)?;
+    }
+    Ok(())
+}
+
+fn parsed_tool_arguments(tool_call: &ChatToolCall) -> Value {
+    serde_json::from_str::<Value>(&tool_call.function.arguments)
+        .unwrap_or_else(|_| json!({"raw": tool_call.function.arguments}))
+}
+
+async fn execute_started_tool_call(
+    app: &AppHandle,
+    state: &AppState,
+    task_id: &str,
+    tool_call: ChatToolCall,
+    settings: &AgentSettings,
+    cancel: &CancellationToken,
+    lifecycle: &agent_loop::events::AgentLifecycle,
+) -> Result<ToolResult, AgentError> {
+    let arguments = parsed_tool_arguments(&tool_call);
+    let model_tool_call_id = tool_call.id.clone();
+    let name = tool_call.function.name.clone();
+    lifecycle
+        .tool_call_started(
+            &tool_call.id,
+            &tool_call.function.name,
+            &tool_call.function.arguments,
+        )
+        .map_err(AgentError::Message)?;
+    perform_tool(
+        app,
+        state,
+        task_id,
+        ToolInvocation {
+            model_tool_call_id: Some(model_tool_call_id),
+            name,
+            arguments,
+        },
+        settings,
+        cancel,
+    )
+    .await
+}
+
+fn record_skipped_tool_call(
+    app: &AppHandle,
+    state: &AppState,
+    task_id: &str,
+    tool_call: &ChatToolCall,
+) -> Result<ToolResult, AgentError> {
+    let ui_tool_call_id = add_tool_call(
+        app,
+        state,
+        task_id,
+        &tool_call.function.name,
+        parsed_tool_arguments(tool_call),
+        Some(tool_call.id.clone()),
+    )
+    .map_err(AgentError::Message)?;
+    finish_tool_call(
+        app,
+        state,
+        task_id,
+        &ui_tool_call_id,
+        ToolCallStatus::Cancelled,
+        None,
+        Some("Tool call skipped because task cancellation arrived before dispatch.".to_string()),
+    )
+    .map_err(AgentError::Message)
+}
+
 fn system_prompt_parts(agent_kind: &str, workspace: &str) -> (String, String) {
     let kind = agent::parse_agent_kind(agent_kind).unwrap_or(agent::AgentKind::Manus);
     let spec = agents::AgentSpec::for_kind(kind, workspace);
@@ -3381,6 +4340,39 @@ async fn run_real(
     task: &Task,
     settings: &AgentSettings,
     cancel: &CancellationToken,
+) -> Result<String, AgentError> {
+    let mut lifecycle = agent_loop::events::AgentLifecycle::start(state, &task.id)
+        .await
+        .map_err(AgentError::Message)?;
+    let result = run_real_inner(app, state, task, settings, cancel, &mut lifecycle).await;
+    let reason = match &result {
+        Ok(_) => agent_loop::events::TurnEndReason::Completed,
+        Err(AgentError::Cancelled) => agent_loop::events::TurnEndReason::Cancelled,
+        Err(AgentError::Message(message))
+            if message.contains("maximum") || message.contains("max steps") =>
+        {
+            agent_loop::events::TurnEndReason::MaxSteps
+        }
+        Err(AgentError::Message(_)) => agent_loop::events::TurnEndReason::Failed,
+    };
+    if let Err(error) = lifecycle.end(reason).await {
+        if result.is_ok() {
+            return Err(AgentError::Message(format!(
+                "Unable to close the durable agent turn: {error}"
+            )));
+        }
+        warn!(task_id = %task.id, error = %error, "Unable to close the durable agent turn");
+    }
+    result
+}
+
+async fn run_real_inner(
+    app: &AppHandle,
+    state: &AppState,
+    task: &Task,
+    settings: &AgentSettings,
+    cancel: &CancellationToken,
+    lifecycle: &mut agent_loop::events::AgentLifecycle,
 ) -> Result<String, AgentError> {
     let task_memory = repair_task_memory(state, &task.id).map_err(AgentError::Message)?;
     ensure_default_plan(state, &task.id).map_err(AgentError::Message)?;
@@ -3444,6 +4436,13 @@ async fn run_real(
     let agent_kind = agent::parse_agent_kind(&task.agent_kind).unwrap_or(agent::AgentKind::Manus);
     let agent_spec = agents::AgentSpec::for_kind(agent_kind, &task.workspace);
     let max_steps = normalize_max_steps(settings.max_steps);
+    let tools = tool_definitions_for_agent(state, &agent_spec);
+    let client = llm::OpenAiCompatibleClient::new(llm_settings_for_task(
+        settings,
+        &task.id,
+        Some(tools.schema_hash.as_ref()),
+    ))
+    .map_err(|error| AgentError::Message(error.to_string()))?;
     let mut runtime = agent::ToolCallAgentRuntime::new(task.agent_name.clone(), system_prompt);
     runtime.base.description = agent_spec.description.clone();
     runtime.base.next_step_prompt = agent_spec.next_step_prompt.clone();
@@ -3477,16 +4476,50 @@ async fn run_real(
             )
             .map_err(AgentError::Message)?
         };
-        let mut completion = stream_openai(
-            app,
+        lifecycle
+            .step_start(round + 1)
+            .await
+            .map_err(AgentError::Message)?;
+        messages = prepare_task_context(
             state,
             &task.id,
             settings,
-            &agent_spec,
-            &messages,
+            &messages[..system_message_count],
+            &client,
+            &tools,
             cancel,
+            lifecycle,
+            false,
         )
         .await?;
+        let mut context_recovery_attempted = false;
+        let mut completion = loop {
+            match stream_openai(
+                app, state, &task.id, settings, &messages, &client, &tools, cancel, lifecycle,
+            )
+            .await
+            {
+                Ok(completion) => break completion,
+                Err(AgentError::Message(error))
+                    if !context_recovery_attempted && is_context_overflow_message(&error) =>
+                {
+                    context_recovery_attempted = true;
+                    messages = prepare_task_context(
+                        state,
+                        &task.id,
+                        settings,
+                        &messages[..system_message_count],
+                        &client,
+                        &tools,
+                        cancel,
+                        lifecycle,
+                        true,
+                    )
+                    .await?;
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let tool_call_count = completion.tool_calls.len();
         completion
             .tool_calls
@@ -3610,6 +4643,10 @@ async fn run_real(
         messages.push(assistant_message);
 
         if completion.tool_calls.is_empty() {
+            lifecycle
+                .step_end("completed_without_tool_call")
+                .await
+                .map_err(AgentError::Message)?;
             finish_step(
                 app,
                 state,
@@ -3695,25 +4732,137 @@ async fn run_real(
         .map_err(AgentError::Message)?;
         let mut termination_answer: Option<String> = None;
         let mut termination_failure: Option<String> = None;
-        for tool_call in &completion.tool_calls {
-            if tool_call.id.is_empty() || tool_call.function.name.is_empty() {
+        let mut tool_results = Vec::with_capacity(completion.tool_calls.len());
+        let mut skipped_calls = HashSet::new();
+        let mut next_call = 0;
+        let mut aborted = false;
+        while next_call < completion.tool_calls.len() && !aborted {
+            let first_call = &completion.tool_calls[next_call];
+            let first_mode = agent_loop::scheduler::execution_mode(
+                &first_call.function.name,
+                &parsed_tool_arguments(first_call),
+            );
+            if first_mode == agent_loop::scheduler::ExecutionMode::Exclusive {
+                if cancel.is_cancelled() {
+                    aborted = true;
+                    break;
+                }
+                let result = execute_started_tool_call(
+                    app,
+                    state,
+                    &task.id,
+                    first_call.clone(),
+                    settings,
+                    cancel,
+                    lifecycle,
+                )
+                .await;
+                tool_results.push((next_call, result));
+                next_call += 1;
+                aborted = cancel.is_cancelled();
                 continue;
             }
-            let arguments = serde_json::from_str::<Value>(&tool_call.function.arguments)
-                .unwrap_or_else(|_| json!({"raw": tool_call.function.arguments}));
-            let result = perform_tool(
-                app,
-                state,
-                &task.id,
-                ToolInvocation {
-                    model_tool_call_id: Some(tool_call.id.clone()),
-                    name: tool_call.function.name.clone(),
-                    arguments: arguments.clone(),
-                },
-                settings,
+
+            let lifecycle_ref: &agent_loop::events::AgentLifecycle = &*lifecycle;
+            let pool = agent_loop::scheduler::run_parallel_pool(
+                next_call,
+                completion.tool_calls.len(),
+                agent_loop::scheduler::MAX_PARALLEL_TOOL_CALLS,
                 cancel,
+                |index| {
+                    let call = &completion.tool_calls[index];
+                    agent_loop::scheduler::execution_mode(
+                        &call.function.name,
+                        &parsed_tool_arguments(call),
+                    )
+                },
+                |index| {
+                    execute_started_tool_call(
+                        app,
+                        state,
+                        &task.id,
+                        completion.tool_calls[index].clone(),
+                        settings,
+                        cancel,
+                        lifecycle_ref,
+                    )
+                },
             )
-            .await?;
+            .await;
+            tool_results.extend(pool.results);
+            next_call = pool.next_index;
+            aborted = pool.aborted;
+        }
+
+        if aborted {
+            for index in next_call..completion.tool_calls.len() {
+                let tool_call = &completion.tool_calls[index];
+                lifecycle
+                    .tool_call_not_started(
+                        &tool_call.id,
+                        &tool_call.function.name,
+                        &tool_call.function.arguments,
+                    )
+                    .map_err(AgentError::Message)?;
+                let result = record_skipped_tool_call(app, state, &task.id, tool_call)?;
+                skipped_calls.insert(index);
+                tool_results.push((index, Ok(result)));
+            }
+        }
+        tool_results.sort_unstable_by_key(|(index, _)| *index);
+        let mut first_tool_error: Option<AgentError> = None;
+        for (index, result) in tool_results {
+            let tool_call = &completion.tool_calls[index];
+            let arguments = parsed_tool_arguments(tool_call);
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    let message = match &error {
+                        AgentError::Cancelled => "Tool execution cancelled.".to_string(),
+                        AgentError::Message(message) => message.clone(),
+                    };
+                    lifecycle
+                        .tool_result(
+                            &tool_call.id,
+                            &tool_call.function.name,
+                            if matches!(&error, AgentError::Cancelled) {
+                                "cancelled_after_start"
+                            } else {
+                                "failed"
+                            },
+                            None,
+                            Some(&message),
+                        )
+                        .await
+                        .map_err(AgentError::Message)?;
+                    if first_tool_error.is_none() {
+                        first_tool_error = Some(error);
+                    }
+                    continue;
+                }
+            };
+            let result_status = if skipped_calls.contains(&index) {
+                "skipped_due_to_cancel"
+            } else {
+                match &result.status {
+                    ToolCallStatus::Pending => "pending",
+                    ToolCallStatus::Running => "running",
+                    ToolCallStatus::Completed => "completed",
+                    ToolCallStatus::Failed => "failed",
+                    ToolCallStatus::Cancelled => "cancelled_after_start",
+                }
+            };
+            let output_preview = result.output.as_deref().map(truncate_output);
+            lifecycle
+                .tool_result(
+                    &tool_call.id,
+                    &tool_call.function.name,
+                    result_status,
+                    output_preview.as_deref(),
+                    result.error.as_deref(),
+                )
+                .await
+                .map_err(AgentError::Message)?;
             if tool_call.function.name == "rust_terminate" {
                 let status = arguments
                     .get("status")
@@ -3752,6 +4901,30 @@ async fn run_real(
                 attachments: Vec::new(),
             });
         }
+        reorder_tool_batch_records(
+            state,
+            &task.id,
+            &completion
+                .tool_calls
+                .iter()
+                .map(|call| call.id.clone())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(AgentError::Message)?;
+        state
+            .checkpoint_persistence()
+            .await
+            .map_err(AgentError::Message)?;
+        if aborted {
+            return Err(AgentError::Cancelled);
+        }
+        if let Some(error) = first_tool_error {
+            return Err(error);
+        }
+        lifecycle
+            .step_end("tool_results_recorded")
+            .await
+            .map_err(AgentError::Message)?;
         finish_step(
             app,
             state,
@@ -3814,7 +4987,7 @@ async fn run_agent(app: AppHandle, state: AppState, task_id: String, cancel: Can
             return;
         }
     };
-    let settings = match state.settings.read() {
+    let mut settings = match state.settings.read() {
         Ok(settings) => settings.clone(),
         Err(_) => {
             let message = "Settings lock is poisoned.".to_string();
@@ -3838,8 +5011,23 @@ async fn run_agent(app: AppHandle, state: AppState, task_id: String, cancel: Can
             return;
         }
     };
+    if let Some(model) = task
+        .model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())
+    {
+        settings.model = model.to_string();
+    }
+    settings.reasoning_effort = task.reasoning_effort;
     let result = if settings.api_key.is_some() {
-        run_real(&app, &state, &task, &settings, &cancel).await
+        if let Some(effort) = settings.reasoning_effort {
+            match llm::validate_reasoning_effort(&settings.model, &settings.api_base_url, effort) {
+                Ok(()) => run_real(&app, &state, &task, &settings, &cancel).await,
+                Err(error) => Err(AgentError::Message(error)),
+            }
+        } else {
+            run_real(&app, &state, &task, &settings, &cancel).await
+        }
     } else {
         Err(AgentError::Message(API_KEY_REQUIRED_MESSAGE.to_string()))
     };
@@ -4249,6 +5437,8 @@ fn create_task_internal(
     attachment_inputs: Vec<attachments::AttachmentInput>,
     attachment_paths: Vec<attachments::AttachmentPathInput>,
     workspace_raw: Option<String>,
+    requested_model: Option<String>,
+    requested_effort: Option<String>,
 ) -> Result<Task, String> {
     let prompt = prompt.trim().to_string();
     if prompt.is_empty() && attachment_inputs.is_empty() && attachment_paths.is_empty() {
@@ -4257,6 +5447,18 @@ fn create_task_internal(
     if !api_key_configured(state)? {
         return Err(API_KEY_REQUIRED_MESSAGE.to_string());
     }
+    let settings = state
+        .settings
+        .read()
+        .map_err(|_| "Settings lock is poisoned".to_string())?
+        .clone();
+    let (selected_model, selected_effort) = resolve_task_model_selection(
+        &settings,
+        requested_model.as_deref(),
+        requested_effort.as_deref(),
+        None,
+        None,
+    )?;
     let fallback_workspace = workspace_root();
     let workspace = match workspace_raw.as_deref() {
         Some(raw) => project_store::normalize_directory(raw)?,
@@ -4282,6 +5484,8 @@ fn create_task_internal(
         created_at,
         updated_at: created_at,
         demo_mode,
+        model: Some(selected_model),
+        reasoning_effort: selected_effort,
         archived: false,
         agent_name: default_agent_name(),
         agent_kind: infer_agent_kind(&prompt),
@@ -4315,6 +5519,7 @@ fn create_task_internal(
             base64_image: None,
             attachments: attachment_refs.clone(),
         }],
+        context: ContextState::default(),
         plans: Vec::new(),
         active_plan_id: None,
         steps: Vec::new(),
@@ -4392,6 +5597,8 @@ async fn create_task(
     attachment_inputs: Option<Vec<attachments::AttachmentInput>>,
     attachment_paths: Option<Vec<attachments::AttachmentPathInput>>,
     workspace: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
 ) -> Result<Task, String> {
     create_task_internal(
         &app,
@@ -4400,6 +5607,8 @@ async fn create_task(
         attachment_inputs.unwrap_or_default(),
         attachment_paths.unwrap_or_default(),
         workspace,
+        model,
+        reasoning_effort,
     )
 }
 
@@ -4410,6 +5619,8 @@ fn continue_task_internal(
     prompt: String,
     attachment_inputs: Vec<attachments::AttachmentInput>,
     attachment_paths: Vec<attachments::AttachmentPathInput>,
+    requested_model: Option<String>,
+    requested_effort: Option<String>,
 ) -> Result<Task, String> {
     let prompt = prompt.trim().to_string();
     if prompt.is_empty() && attachment_inputs.is_empty() && attachment_paths.is_empty() {
@@ -4429,7 +5640,7 @@ fn continue_task_internal(
         );
     }
 
-    {
+    let (existing_model, existing_effort) = {
         let tasks = state
             .tasks
             .read()
@@ -4442,7 +5653,27 @@ fn continue_task_internal(
                 "Restore the archived task before continuing the conversation.".to_string(),
             );
         }
-    }
+        (task.model.clone(), task.reasoning_effort)
+    };
+    let settings = state
+        .settings
+        .read()
+        .map_err(|_| "Settings lock is poisoned".to_string())?
+        .clone();
+    let requested_model_value = requested_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let model_changed =
+        requested_model_value.is_some_and(|value| existing_model.as_deref() != Some(value));
+    let fallback_effort = (!model_changed).then_some(existing_effort).flatten();
+    let (selected_model, selected_effort) = resolve_task_model_selection(
+        &settings,
+        requested_model_value,
+        requested_effort.as_deref(),
+        existing_model.as_deref(),
+        fallback_effort,
+    )?;
 
     let attachment_refs =
         store_task_attachments(state, &task_id, &attachment_inputs, &attachment_paths)?;
@@ -4497,11 +5728,13 @@ fn continue_task_internal(
         task.error = None;
         task.final_answer = None;
         task.demo_mode = false;
+        task.model = Some(selected_model.clone());
+        task.reasoning_effort = selected_effort;
         task.plans.clear();
         task.active_plan_id = None;
         task.messages.push(message.clone());
         task.memory.push(memory);
-        trim_memory_to_budget(&mut task.memory, MAX_MEMORY_ENTRIES);
+        invalidate_context_surface_hash(task);
         touch_task(task);
         Ok::<(), String>(())
     })();
@@ -4536,6 +5769,8 @@ async fn continue_task(
     prompt: String,
     attachment_inputs: Option<Vec<attachments::AttachmentInput>>,
     attachment_paths: Option<Vec<attachments::AttachmentPathInput>>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
 ) -> Result<Task, String> {
     continue_task_internal(
         &app,
@@ -4544,6 +5779,8 @@ async fn continue_task(
         prompt,
         attachment_inputs.unwrap_or_default(),
         attachment_paths.unwrap_or_default(),
+        model,
+        reasoning_effort,
     )
 }
 
@@ -4612,6 +5849,7 @@ async fn retry_task(
             base64_image: None,
             attachments: initial_attachments,
         }];
+        invalidate_context_surface_hash(task);
         task.plans.clear();
         task.active_plan_id = None;
         task.steps.clear();
@@ -4752,6 +5990,17 @@ async fn get_settings(state: State<'_, AppState>) -> Result<SettingsView, String
         .read()
         .map_err(|_| "Settings lock is poisoned".to_string())?;
     Ok(settings_view(&settings, Some(&state)))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn get_model_capabilities(
+    model: String,
+    base_url: String,
+) -> Result<model_catalog::ModelCapabilities, String> {
+    if model.trim().is_empty() {
+        return Err("Model name cannot be empty.".to_string());
+    }
+    Ok(model_catalog::capabilities(&model, &base_url, ""))
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -4903,8 +6152,16 @@ fn spawn_a2a_server(app: &AppHandle, state: &AppState) {
         let app = app_handle.clone();
         let state = app_state.clone();
         Box::pin(async move {
-            let task = match create_task_internal(&app, &state, query, Vec::new(), Vec::new(), None)
-            {
+            let task = match create_task_internal(
+                &app,
+                &state,
+                query,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                None,
+            ) {
                 Ok(task) => task,
                 Err(error) => return protocol::A2AResponse::error(error),
             };
@@ -4982,6 +6239,7 @@ pub fn run() {
             restore_task,
             delete_task,
             get_settings,
+            get_model_capabilities,
             update_settings,
             respond_to_approval
         ])

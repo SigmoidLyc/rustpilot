@@ -1804,6 +1804,218 @@ summary:focus-visible {
   flex: 0 0 auto;
 }
 
+.composer-selection-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.composer-model,
+.composer-reasoning {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.composer-selection-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 35px;
+  padding: 0 6px;
+  color: var(--muted);
+  border-radius: 4px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.composer-selection-trigger::-webkit-details-marker {
+  display: none;
+}
+
+.composer-selection-trigger:hover,
+.composer-model[open] .composer-selection-trigger,
+.composer-reasoning[open] .composer-selection-trigger {
+  color: var(--ink);
+  background: #e9eef1;
+}
+
+.composer-selection-disabled {
+  color: #bdc6cb !important;
+  cursor: not-allowed !important;
+}
+
+.composer-model-trigger {
+  max-width: 184px;
+  gap: 5px;
+}
+
+.composer-model-name,
+.composer-reasoning-label {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-model-name {
+  max-width: 142px;
+}
+
+.composer-reasoning .composer-selection-trigger {
+  gap: 4px;
+}
+
+.composer-reasoning-label {
+  max-width: 64px;
+}
+
+.composer-selection-chevron {
+  flex: 0 0 auto;
+  transition: transform 140ms ease;
+}
+
+.composer-model[open] .composer-selection-chevron,
+.composer-reasoning[open] .composer-selection-chevron {
+  transform: rotate(180deg);
+}
+
+.composer-selection-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 10px);
+  z-index: 20;
+  display: grid;
+  gap: 5px;
+  padding: 10px;
+  background: var(--surface);
+  border: 1px solid #cbd5db;
+  border-radius: 6px;
+  box-shadow: 0 12px 30px rgba(22, 35, 45, 0.14);
+}
+
+.composer-model-menu {
+  width: min(320px, calc(100vw - 28px));
+}
+
+.composer-reasoning-menu {
+  width: min(276px, calc(100vw - 28px));
+}
+
+.composer-selection-heading {
+  display: grid;
+  gap: 3px;
+  padding: 2px 4px 7px;
+}
+
+.composer-selection-heading strong {
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.composer-model-field {
+  display: grid;
+  gap: 4px;
+  padding: 0 2px 2px;
+}
+
+.composer-model-field span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.composer-model-field input {
+  width: 100%;
+  min-height: 31px;
+  padding: 5px 8px;
+  color: var(--ink);
+  background: var(--surface-muted);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  outline: 0;
+  font-size: 11px;
+}
+
+.composer-model-field input:focus {
+  border-color: #91b0c7;
+  box-shadow: 0 0 0 2px rgba(61, 111, 157, 0.1);
+}
+
+.composer-selection-apply {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 31px;
+  padding: 0 9px;
+  color: var(--ink);
+  background: var(--surface-muted);
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.composer-selection-apply:hover:not(:disabled) {
+  background: #e9eef1;
+  border-color: #cbd5db;
+}
+
+.composer-selection-apply:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.composer-selection-option {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 43px;
+  padding: 6px 8px;
+  color: var(--muted);
+  text-align: left;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.composer-selection-option:hover:not(:disabled) {
+  background: var(--surface-muted);
+  border-color: var(--line-soft);
+}
+
+.composer-selection-option-active {
+  color: var(--ink);
+  background: #f0f5f5;
+  border-color: #c7d8d5;
+}
+
+.composer-selection-option:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.composer-selection-option-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.composer-selection-option-copy strong {
+  color: inherit;
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .attach-button {
   width: 32px;
   height: 35px;
@@ -2867,6 +3079,18 @@ summary:focus-visible {
 
   .composer-approval-menu {
     left: -8px;
+  }
+
+  .composer-model-trigger {
+    max-width: 132px;
+  }
+
+  .composer-model-name {
+    max-width: 90px;
+  }
+
+  .composer-reasoning-label {
+    max-width: 50px;
   }
 
   .settings-panel,

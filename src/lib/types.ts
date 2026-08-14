@@ -8,6 +8,50 @@ export type AgentStatus =
   | "failed"
   | "cancelled";
 
+export type ReasoningEffort =
+  | "none"
+  | "minimal"
+  | "off"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max"
+  | "ultra";
+export type ReasoningEffortSelection = ReasoningEffort | "default";
+
+export interface TaskModelSelection {
+  model: string;
+  reasoning_effort: ReasoningEffortSelection;
+}
+
+export interface ModelVariant {
+  id: ReasoningEffort;
+  name: string;
+}
+
+export interface ModelCapabilityFlags {
+  temperature: boolean;
+  reasoning: boolean;
+  attachment: boolean;
+  tool_call: boolean;
+  input: string[];
+  output: string[];
+}
+
+export interface ModelReasoningOption {
+  type: "effort";
+  values: ReasoningEffort[];
+}
+
+export interface ModelCapabilities {
+  id: string;
+  name: string;
+  capabilities: ModelCapabilityFlags;
+  reasoning_options: ModelReasoningOption[];
+  variants: ModelVariant[];
+}
+
 export type StepPhase = "plan" | "act" | "verify";
 export type StepStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 export type ToolCallStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
@@ -180,6 +224,8 @@ export interface Task {
   created_at: number;
   updated_at: number;
   demo_mode: boolean;
+  model?: string;
+  reasoning_effort?: ReasoningEffort | null;
   archived: boolean;
   agent_name: string;
   agent_kind: string;

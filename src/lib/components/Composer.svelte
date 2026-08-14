@@ -4,6 +4,7 @@
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import {
     ArrowUp,
+    Brain,
     Check,
     ChevronDown,
     FileText,
@@ -11,20 +12,38 @@
     Paperclip,
     ShieldAlert,
     ShieldCheck,
+    Settings2,
     Square,
     X
   } from "lucide-svelte";
   import { fileMime, mimeForName, MAX_ATTACHMENTS, MAX_ATTACHMENT_BYTES } from "../attachments";
   import { isTauriRuntime } from "../api";
-  import type { ApprovalMode, AttachmentPathInput } from "../types";
+  import { reasoningEffortName, reasoningEffortOptions } from "../reasoning";
+  import type {
+    ApprovalMode,
+    AttachmentPathInput,
+    ModelCapabilities,
+    ReasoningEffortSelection,
+    TaskModelSelection
+  } from "../types";
 
   export let busy = false;
   export let disabled = false;
   export let placeholder = "Describe a task...";
+  export let model = "";
+  export let capabilities: ModelCapabilities;
+  export let reasoningEffort: ReasoningEffortSelection = "default";
   export let approvalMode: ApprovalMode = "guarded";
   export let onApprovalModeChange: (mode: ApprovalMode) => Promise<boolean> | boolean = () => true;
   export let onSend:
-    (prompt: string, files: File[], paths: AttachmentPathInput[]) => Promise<boolean> | boolean;
+    (
+      prompt: string,
+      files: File[],
+      paths: AttachmentPathInput[],
+      selection: TaskModelSelection
+    ) => Promise<boolean> | boolean;
+  export let onModelChange: (model: string) => void = () => {};
+  export let onReasoningEffortChange: (effort: ReasoningEffortSelection) => void = () => {};
   export let onStop: () => void;
 
   type PendingAttachment = {
@@ -45,8 +64,21 @@
   let localError = "";
   let approvalSaving = false;
   let approvalMenu: HTMLDetailsElement;
+  let modelMenu: HTMLDetailsElement;
+  let reasoningMenu: HTMLDetailsElement;
+  let modelMenuPanel: HTMLDivElement;
+  let reasoningMenuPanel: HTMLDivElement;
+  let modelDraft = "";
+  let previousModel = "";
   let removeNativeDrop: (() => void) | undefined;
   let composerElement: HTMLFormElement;
+
+  $: if (model !== previousModel) {
+    previousModel = model;
+    modelDraft = model;
+  }
+  $: reasoningOptions = reasoningEffortOptions(capabilities);
+  $: reasoningLabel = reasoningEffortName(reasoningEffort, reasoningOptions);
 
   $: canSubmit =
     !busy &&
@@ -197,19 +229,79 @@
     if (disabled || busy || submitting || approvalSaving) event.preventDefault();
   }
 
+  function toggleSelectionMenu(event: MouseEvent): void {
+    if (disabled || busy || submitting) event.preventDefault();
+  }
+
   function closeApprovalMenu(): void {
     if (approvalMenu) approvalMenu.open = false;
   }
 
+  function closeModelMenu(): void {
+    if (modelMenu) modelMenu.open = false;
+  }
+
+  function closeReasoningMenu(): void {
+    if (reasoningMenu) reasoningMenu.open = false;
+  }
+
+  function alignSelectionMenu(menu: HTMLDivElement, anchor: HTMLDetailsElement): void {
+    if (!menu || !anchor?.open) return;
+    const anchorRect = anchor.getBoundingClientRect();
+    const menuWidth = menu.getBoundingClientRect().width;
+    const viewportPadding = 14;
+    const minLeft = viewportPadding;
+    const maxLeft = Math.max(minLeft, window.innerWidth - viewportPadding - menuWidth);
+    const preferredLeft = anchorRect.right - menuWidth;
+    const left = Math.min(Math.max(preferredLeft, minLeft), maxLeft);
+    menu.style.left = `${left - anchorRect.left}px`;
+    menu.style.right = "auto";
+  }
+
+  function scheduleSelectionMenuAlignment(menu: HTMLDivElement, anchor: HTMLDetailsElement): void {
+    requestAnimationFrame(() => alignSelectionMenu(menu, anchor));
+  }
+
+  function handleWindowResize(): void {
+    if (modelMenu?.open) alignSelectionMenu(modelMenuPanel, modelMenu);
+    if (reasoningMenu?.open) alignSelectionMenu(reasoningMenuPanel, reasoningMenu);
+  }
+
   function handleWindowClick(event: MouseEvent): void {
     if (approvalMenu?.open && !approvalMenu.contains(event.target as Node)) closeApprovalMenu();
+    if (modelMenu?.open && !modelMenu.contains(event.target as Node)) closeModelMenu();
+    if (reasoningMenu?.open && !reasoningMenu.contains(event.target as Node)) closeReasoningMenu();
   }
 
   function handleWindowKeydown(event: KeyboardEvent): void {
     if (event.key === "Escape" && approvalMenu?.open) {
       closeApprovalMenu();
       event.stopPropagation();
+    } else if (event.key === "Escape" && modelMenu?.open) {
+      closeModelMenu();
+      event.stopPropagation();
+    } else if (event.key === "Escape" && reasoningMenu?.open) {
+      closeReasoningMenu();
+      event.stopPropagation();
     }
+  }
+
+  function applyModel(): void {
+    const next = modelDraft.trim();
+    if (!next) {
+      localError = "Enter a model name before applying it.";
+      return;
+    }
+    localError = "";
+    onModelChange(next);
+    closeModelMenu();
+  }
+
+  function selectReasoningEffort(value: ReasoningEffortSelection): void {
+    if (disabled || busy || submitting) return;
+    localError = "";
+    onReasoningEffortChange(value);
+    closeReasoningMenu();
   }
 
   async function selectApprovalMode(mode: ApprovalMode): Promise<void> {
@@ -233,6 +325,10 @@
   async function submit(): Promise<void> {
     const value = prompt.trim();
     if (!canSubmit) return;
+    if (!model.trim()) {
+      localError = "Select a model before sending.";
+      return;
+    }
     submitting = true;
     localError = "";
     try {
@@ -243,7 +339,8 @@
           attachment.path
             ? [{ path: attachment.path, name: attachment.name, mime: attachment.mime }]
             : []
-        )
+        ),
+        { model: model.trim(), reasoning_effort: reasoningEffort }
       );
       if (accepted) {
         prompt = "";
@@ -294,7 +391,11 @@
   onDestroy(clearAttachments);
 </script>
 
-<svelte:window on:click={handleWindowClick} on:keydown={handleWindowKeydown} />
+<svelte:window
+  on:click={handleWindowClick}
+  on:keydown={handleWindowKeydown}
+  on:resize={handleWindowResize}
+/>
 
 <form
   bind:this={composerElement}
@@ -421,6 +522,106 @@
       </button>
     </div>
     <div class="composer-actions">
+      <div class="composer-selection-actions">
+        <details
+          class="composer-model"
+          bind:this={modelMenu}
+          on:toggle={() => scheduleSelectionMenuAlignment(modelMenuPanel, modelMenu)}
+        >
+          <summary
+            class="composer-selection-trigger composer-model-trigger"
+            class:composer-selection-disabled={disabled || busy || submitting}
+            title={`Model: ${model || "Not selected"}`}
+            aria-label={`Model: ${model || "Not selected"}`}
+            on:click={toggleSelectionMenu}
+          >
+            <Settings2 size={14} />
+            <span class="composer-model-name">{model || "Model"}</span>
+            <ChevronDown size={13} class="composer-selection-chevron" />
+          </summary>
+          <div bind:this={modelMenuPanel} class="composer-selection-menu composer-model-menu">
+            <div class="composer-selection-heading">
+              <strong>Model</strong>
+            </div>
+            <label class="composer-model-field">
+              <span>Model name</span>
+              <input
+                bind:value={modelDraft}
+                type="text"
+                spellcheck="false"
+                autocomplete="off"
+                disabled={disabled || busy || submitting}
+                on:keydown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    applyModel();
+                  }
+                }}
+              />
+            </label>
+            <button
+              class="composer-selection-apply"
+              type="button"
+              disabled={disabled || busy || submitting || !modelDraft.trim()}
+              on:click={applyModel}
+            >
+              <Check size={14} />
+              Apply model
+            </button>
+          </div>
+        </details>
+
+        {#if reasoningOptions.length > 0}
+          <details
+            class="composer-reasoning"
+            bind:this={reasoningMenu}
+            on:toggle={() => scheduleSelectionMenuAlignment(reasoningMenuPanel, reasoningMenu)}
+          >
+            <summary
+              class="composer-selection-trigger"
+              class:composer-selection-disabled={disabled || busy || submitting}
+              title={`Reasoning effort: ${reasoningLabel}`}
+              aria-label={`Reasoning effort: ${reasoningLabel}`}
+              on:click={toggleSelectionMenu}
+            >
+              <Brain size={15} />
+              <span class="composer-reasoning-label">{reasoningLabel}</span>
+              <ChevronDown size={13} class="composer-selection-chevron" />
+            </summary>
+            <div bind:this={reasoningMenuPanel} class="composer-selection-menu composer-reasoning-menu">
+              <div class="composer-selection-heading">
+                <strong>Reasoning effort</strong>
+              </div>
+              <button
+                class:composer-selection-option-active={reasoningEffort === "default"}
+                class="composer-selection-option"
+                type="button"
+                disabled={disabled || busy || submitting}
+                on:click={() => selectReasoningEffort("default")}
+              >
+                <span class="composer-selection-option-copy">
+                  <strong>Default</strong>
+                </span>
+                {#if reasoningEffort === "default"}<Check size={15} />{/if}
+              </button>
+              {#each reasoningOptions as option (option.id)}
+                <button
+                  class:composer-selection-option-active={reasoningEffort === option.id}
+                  class="composer-selection-option"
+                  type="button"
+                  disabled={disabled || busy || submitting}
+                  on:click={() => selectReasoningEffort(option.id)}
+                >
+                  <span class="composer-selection-option-copy">
+                    <strong>{option.name}</strong>
+                  </span>
+                  {#if reasoningEffort === option.id}<Check size={15} />{/if}
+                </button>
+              {/each}
+            </div>
+          </details>
+        {/if}
+      </div>
       {#if busy}
         <button
           class="stop-button"

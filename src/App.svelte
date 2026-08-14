@@ -13,6 +13,7 @@
     continueTask,
     archiveTask,
     deleteTask,
+    getModelCapabilities,
     getSettings,
     getTask,
     getTaskEvents,
@@ -39,6 +40,7 @@
     AttachmentPathInput,
     ApprovalMode,
     ApprovalRequest,
+    ModelCapabilities,
     SettingsInput,
     SettingsView,
     Task,
@@ -52,6 +54,8 @@
     TaskCancelledEvent,
     TaskEvent,
     PersistedStreamEvent,
+    ReasoningEffortSelection,
+    TaskModelSelection,
     ToolCall,
     ToolResult
   } from "./lib/types";
@@ -69,6 +73,186 @@
     available_tools: []
   };
 
+  const COMPOSER_PREFERENCES_KEY = "rustpilot.composer-preferences.v1";
+
+  type ComposerPreferences = {
+    base_url: string;
+    model: string;
+    efforts: Record<string, ReasoningEffortSelection>;
+  };
+
+  function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null;
+  }
+
+  function isReasoningEffortSelection(value: unknown): value is ReasoningEffortSelection {
+    return (
+      value === "default" ||
+      value === "none" ||
+      value === "minimal" ||
+      value === "off" ||
+      value === "low" ||
+      value === "medium" ||
+      value === "high" ||
+      value === "xhigh" ||
+      value === "max" ||
+      value === "ultra"
+    );
+  }
+
+  function normalizedBaseUrl(value: string): string {
+    return value.trim().replace(/\/+$/, "").toLowerCase();
+  }
+
+  function modelPreferenceKey(value: string): string {
+    return value.trim().toLowerCase();
+  }
+
+  function readComposerPreferences(): ComposerPreferences {
+    const fallback: ComposerPreferences = {
+      base_url: normalizedBaseUrl(defaultSettings.api_base_url),
+      model: defaultSettings.model,
+      efforts: {}
+    };
+    if (typeof window === "undefined") return fallback;
+    try {
+      const raw = window.localStorage.getItem(COMPOSER_PREFERENCES_KEY);
+      if (!raw) return fallback;
+      const parsed: unknown = JSON.parse(raw);
+      if (!isRecord(parsed)) return fallback;
+      const efforts: Record<string, ReasoningEffortSelection> = {};
+      if (isRecord(parsed.efforts)) {
+        for (const [model, value] of Object.entries(parsed.efforts)) {
+          if (modelPreferenceKey(model) && isReasoningEffortSelection(value)) {
+            efforts[modelPreferenceKey(model)] = value;
+          }
+        }
+      }
+      return {
+        base_url:
+          typeof parsed.base_url === "string" && parsed.base_url.trim()
+            ? normalizedBaseUrl(parsed.base_url)
+            : fallback.base_url,
+        model: typeof parsed.model === "string" ? parsed.model.trim() : fallback.model,
+        efforts
+      };
+    } catch {
+      return fallback;
+    }
+  }
+
+  function writeComposerPreferences(preferences: ComposerPreferences): void {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(COMPOSER_PREFERENCES_KEY, JSON.stringify(preferences));
+    } catch {
+      // Local storage can be unavailable in a restricted WebView profile.
+    }
+  }
+
+  let composerPreferences = readComposerPreferences();
+
+  function storedComposerEffort(model: string): ReasoningEffortSelection {
+    const saved = composerPreferences.efforts[modelPreferenceKey(model)];
+    return saved ?? "default";
+  }
+
+  function emptyModelCapabilities(model = ""): ModelCapabilities {
+    return {
+      id: model.trim(),
+      name: model.trim() || "Model",
+      capabilities: {
+        temperature: true,
+        reasoning: false,
+        attachment: false,
+        tool_call: true,
+        input: ["text"],
+        output: ["text"]
+      },
+      reasoning_options: [],
+      variants: []
+    };
+  }
+
+  function composerCapabilitiesKey(model: string, baseUrl: string): string {
+    return `${normalizedBaseUrl(baseUrl)}\u0000${modelPreferenceKey(model)}`;
+  }
+
+  function capabilitySupportsEffort(
+    capabilities: ModelCapabilities,
+    effort: ReasoningEffortSelection
+  ): boolean {
+    return effort === "default" || capabilities.variants.some((variant) => variant.id === effort);
+  }
+
+  function rememberComposerSelection(model: string, effort: ReasoningEffortSelection): void {
+    const key = modelPreferenceKey(model);
+    if (!key) return;
+    const efforts = { ...composerPreferences.efforts };
+    if (effort === "default") delete efforts[key];
+    else efforts[key] = effort;
+    composerPreferences = {
+      ...composerPreferences,
+      base_url: normalizedBaseUrl(settings.api_base_url),
+      model: model.trim(),
+      efforts
+    };
+    writeComposerPreferences(composerPreferences);
+  }
+
+  function adoptComposerPreferences(baseUrl: string, fallbackModel: string): void {
+    const sameEndpoint = composerPreferences.base_url === normalizedBaseUrl(baseUrl);
+    composerModel = sameEndpoint && composerPreferences.model ? composerPreferences.model : fallbackModel;
+    composerReasoningEffort = storedComposerEffort(composerModel);
+    composerCapabilities = emptyModelCapabilities(composerModel);
+    composerPreferences = {
+      ...composerPreferences,
+      base_url: normalizedBaseUrl(baseUrl),
+      model: composerModel
+    };
+    writeComposerPreferences(composerPreferences);
+    void refreshComposerCapabilities(composerModel, baseUrl);
+  }
+
+  const modelCapabilitiesCache = new Map<string, ModelCapabilities>();
+  let composerCapabilitiesGeneration = 0;
+
+  async function refreshComposerCapabilities(
+    model = composerModel,
+    baseUrl = settings.api_base_url
+  ): Promise<void> {
+    const requestedModel = model.trim();
+    const key = composerCapabilitiesKey(requestedModel, baseUrl);
+    const generation = ++composerCapabilitiesGeneration;
+    composerCapabilities = emptyModelCapabilities(requestedModel);
+    if (!requestedModel || !isTauriRuntime) return;
+
+    const cached = modelCapabilitiesCache.get(key);
+    if (cached) {
+      if (generation === composerCapabilitiesGeneration && composerCapabilitiesKey(composerModel, settings.api_base_url) === key) {
+        composerCapabilities = cached;
+        if (!capabilitySupportsEffort(cached, composerReasoningEffort)) {
+          composerReasoningEffort = "default";
+        }
+      }
+      return;
+    }
+
+    try {
+      const resolved = await getModelCapabilities(requestedModel, baseUrl);
+      modelCapabilitiesCache.set(key, resolved);
+      if (generation !== composerCapabilitiesGeneration) return;
+      if (composerCapabilitiesKey(composerModel, settings.api_base_url) !== key) return;
+      composerCapabilities = resolved;
+      if (!capabilitySupportsEffort(resolved, composerReasoningEffort)) {
+        composerReasoningEffort = "default";
+      }
+    } catch {
+      // Unknown/custom endpoints remain usable with provider defaults; the
+      // Rust request gate still rejects any explicitly unsupported variant.
+    }
+  }
+
   let tasks: TaskSummary[] = [];
   let archivedTasks: TaskSummary[] = [];
   let projects: ProjectSummary[] = [];
@@ -77,6 +261,13 @@
   let selectedTask: Task | null = null;
   let selectedTaskId = "";
   let settings = defaultSettings;
+  let composerModel =
+    composerPreferences.base_url === normalizedBaseUrl(defaultSettings.api_base_url) &&
+    composerPreferences.model
+      ? composerPreferences.model
+      : defaultSettings.model;
+  let composerReasoningEffort: ReasoningEffortSelection = storedComposerEffort(composerModel);
+  let composerCapabilities = emptyModelCapabilities(composerModel);
   let settingsVisible = false;
   let settingsSaving = false;
   let traceCollapsed = true;
@@ -125,6 +316,16 @@
     selectedTaskId = task.id;
     selectedTask = task;
     selectedWorkspace = task.workspace;
+    const model = task.model?.trim() || settings.model;
+    const taskEffort = task.reasoning_effort;
+    composerModel = model;
+    composerReasoningEffort =
+      taskEffort !== undefined &&
+      taskEffort !== null &&
+      isReasoningEffortSelection(taskEffort)
+        ? taskEffort
+        : storedComposerEffort(model);
+    void refreshComposerCapabilities(model, settings.api_base_url);
     const knownCursor = eventCursors.get(task.id) ?? 0;
     eventCursors.set(task.id, resetCursor ? task.event_seq : Math.max(knownCursor, task.event_seq));
     upsertSummary(summaryForTask(task));
@@ -531,6 +732,9 @@
       recentlyClosedProjects = loadedRecentProjects;
       selectedWorkspace = loadedProjects[0]?.directory ?? "";
       settings = loadedSettings;
+      if (!selectedTask) {
+        adoptComposerPreferences(loadedSettings.api_base_url, loadedSettings.model);
+      }
     } catch (error) {
       runtimeError = error instanceof Error ? error.message : String(error);
     }
@@ -565,6 +769,7 @@
     bufferedEvents = [];
     selectedTask = null;
     selectedTaskId = "";
+    adoptComposerPreferences(settings.api_base_url, settings.model);
     pendingApproval = null;
     actionError = "";
   }
@@ -644,7 +849,8 @@
   async function sendTask(
     prompt: string,
     files: File[],
-    paths: AttachmentPathInput[]
+    paths: AttachmentPathInput[],
+    selection: TaskModelSelection
   ): Promise<boolean> {
     actionError = "";
     if (!isTauriRuntime) {
@@ -658,8 +864,22 @@
     try {
       const attachments = await serializeFiles(files);
       const task = selectedTask
-        ? await continueTask(selectedTask.id, prompt, attachments, paths)
-        : await createTask(prompt, attachments, paths, selectedWorkspace || undefined);
+        ? await continueTask(
+            selectedTask.id,
+            prompt,
+            attachments,
+            paths,
+            selection.model,
+            selection.reasoning_effort
+          )
+        : await createTask(
+            prompt,
+            attachments,
+            paths,
+            selectedWorkspace || undefined,
+            selection.model,
+            selection.reasoning_effort
+          );
       handleCreated(task);
       await syncTask(task.id);
       return true;
@@ -667,6 +887,25 @@
       actionError = error instanceof Error ? error.message : String(error);
       return false;
     }
+  }
+
+  function changeComposerModel(model: string): void {
+    rememberComposerSelection(composerModel, composerReasoningEffort);
+    composerModel = model.trim();
+    composerReasoningEffort = storedComposerEffort(composerModel);
+    composerCapabilities = emptyModelCapabilities(composerModel);
+    composerPreferences = {
+      ...composerPreferences,
+      base_url: normalizedBaseUrl(settings.api_base_url),
+      model: composerModel
+    };
+    writeComposerPreferences(composerPreferences);
+    void refreshComposerCapabilities(composerModel, settings.api_base_url);
+  }
+
+  function changeComposerReasoningEffort(effort: ReasoningEffortSelection): void {
+    composerReasoningEffort = effort;
+    rememberComposerSelection(composerModel, effort);
   }
 
   async function stopCurrentTask(): Promise<void> {
@@ -756,6 +995,18 @@
     actionError = "";
     try {
       settings = await updateSettings(input);
+      if (!selectedTask) {
+        composerModel = settings.model;
+        composerReasoningEffort = storedComposerEffort(composerModel);
+        composerCapabilities = emptyModelCapabilities(composerModel);
+        composerPreferences = {
+          ...composerPreferences,
+          base_url: normalizedBaseUrl(settings.api_base_url),
+          model: composerModel
+        };
+        writeComposerPreferences(composerPreferences);
+      }
+      void refreshComposerCapabilities(composerModel, settings.api_base_url);
       settingsVisible = false;
     } catch (error) {
       actionError = error instanceof Error ? error.message : String(error);
@@ -865,8 +1116,13 @@
           busy={taskIsBusy}
           disabled={!isTauriRuntime}
           placeholder={settings.demo_mode ? "Configure an API key in Settings to start..." : "Describe a task..."}
+          model={composerModel}
+          capabilities={composerCapabilities}
+          reasoningEffort={composerReasoningEffort}
           approvalMode={settings.approval_mode}
           onApprovalModeChange={changeApprovalMode}
+          onModelChange={changeComposerModel}
+          onReasoningEffortChange={changeComposerReasoningEffort}
           onSend={sendTask}
           onStop={stopCurrentTask}
         />

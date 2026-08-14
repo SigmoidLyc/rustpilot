@@ -10,6 +10,8 @@ use std::{
 use rusqlite::{params, Connection, Transaction};
 use tracing::{info, warn};
 
+use crate::agent_loop::provenance::ContextEventRecord;
+
 use super::task_events::{
     apply_persisted_stream_event, decode_persisted_stream_event, PersistedTaskEvent,
 };
@@ -17,7 +19,7 @@ use super::{now, Task};
 
 pub(crate) const LEGACY_TASK_FILE: &str = "tasks.json";
 const TASK_DATABASE_FILE: &str = "tasks.db";
-const TASK_SCHEMA_VERSION: i64 = 2;
+const TASK_SCHEMA_VERSION: i64 = 4;
 
 fn preserve_invalid_task_file(path: &Path) {
     let file_name = path
@@ -137,7 +139,37 @@ pub(crate) fn open_task_database(path: &Path) -> Result<Connection, String> {
                  payload TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS task_event_task_seq_idx
-                 ON task_event(task_id, seq);",
+                 ON task_event(task_id, seq);
+             CREATE TABLE IF NOT EXISTS agent_event (
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                 task_id TEXT NOT NULL REFERENCES task_state(id) ON DELETE CASCADE,
+                 revision INTEGER NOT NULL,
+                 turn_id TEXT NOT NULL,
+                 step INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 occurred_at INTEGER NOT NULL,
+                 payload TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS agent_event_task_seq_idx
+                 ON agent_event(task_id, seq);
+             CREATE TABLE IF NOT EXISTS context_event (
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                 task_id TEXT NOT NULL REFERENCES task_state(id) ON DELETE CASCADE,
+                 compaction_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 source_start TEXT,
+                 source_end TEXT,
+                 source_hash TEXT NOT NULL,
+                 shadowed_tokens INTEGER NOT NULL DEFAULT 0,
+                 surface_tokens INTEGER NOT NULL DEFAULT 0,
+                 occurred_at INTEGER NOT NULL,
+                 payload TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS context_event_task_seq_idx
+                 ON context_event(task_id, seq);
+             CREATE INDEX IF NOT EXISTS context_event_task_compaction_idx
+                 ON context_event(task_id, compaction_id, seq);",
         )
         .map_err(|error| format!("Unable to initialize task database schema: {error}"))?;
 
@@ -228,6 +260,265 @@ pub(crate) fn set_task_event_floor(
         )
         .map_err(|error| format!("Unable to persist task event floor: {error}"))?;
     Ok(())
+}
+
+pub(crate) fn insert_agent_event(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    revision: u64,
+    turn_id: &str,
+    step: u32,
+    kind: &str,
+    occurred_at: i64,
+    payload: &str,
+) -> Result<(), String> {
+    transaction
+        .execute(
+            "INSERT INTO agent_event(task_id, revision, turn_id, step, kind, occurred_at, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                task_id,
+                revision as i64,
+                turn_id,
+                step as i64,
+                kind,
+                occurred_at,
+                payload
+            ],
+        )
+        .map_err(|error| format!("Unable to persist agent event for {task_id}: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn insert_context_event(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    event: &ContextEventRecord,
+) -> Result<(), String> {
+    let payload = serde_json::to_string(&event.payload)
+        .map_err(|error| format!("Unable to encode context event payload: {error}"))?;
+    transaction
+        .execute(
+            "INSERT INTO context_event(
+                 task_id, compaction_id, generation, kind, source_start, source_end,
+                 source_hash, shadowed_tokens, surface_tokens, occurred_at, payload
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                task_id,
+                event.compaction_id,
+                event.generation as i64,
+                event.kind,
+                event.source_start,
+                event.source_end,
+                event.source_hash,
+                event.shadowed_tokens as i64,
+                event.surface_tokens as i64,
+                event.occurred_at,
+                payload,
+            ],
+        )
+        .map_err(|error| format!("Unable to persist context event for {task_id}: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn repair_interrupted_context_events(
+    connection: &mut Connection,
+) -> Result<usize, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT task_id, compaction_id, generation, kind, source_start, source_end,
+                    source_hash, shadowed_tokens, surface_tokens
+             FROM context_event
+             ORDER BY seq",
+        )
+        .map_err(|error| format!("Unable to inspect context events: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)? as usize,
+                row.get::<_, i64>(8)? as usize,
+            ))
+        })
+        .map_err(|error| format!("Unable to read context events: {error}"))?;
+    let mut open = HashMap::<
+        (String, String),
+        (u64, Option<String>, Option<String>, String, usize, usize),
+    >::new();
+    for row in rows {
+        let (
+            task_id,
+            compaction_id,
+            generation,
+            kind,
+            source_start,
+            source_end,
+            source_hash,
+            shadowed_tokens,
+            surface_tokens,
+        ) = row.map_err(|error| format!("Unable to decode context event: {error}"))?;
+        let key = (task_id, compaction_id);
+        if kind == "compaction_start" {
+            open.insert(
+                key,
+                (
+                    generation,
+                    source_start,
+                    source_end,
+                    source_hash,
+                    shadowed_tokens,
+                    surface_tokens,
+                ),
+            );
+        } else if kind == "compaction_end" {
+            open.remove(&key);
+        }
+    }
+    drop(statement);
+    if open.is_empty() {
+        return Ok(0);
+    }
+
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("Unable to begin context repair: {error}"))?;
+    let occurred_at = super::now();
+    let count = open.len();
+    for (
+        (task_id, compaction_id),
+        (generation, source_start, source_end, source_hash, shadowed_tokens, surface_tokens),
+    ) in open
+    {
+        let event = ContextEventRecord::new(
+            "compaction_end",
+            compaction_id,
+            generation,
+            source_start,
+            source_end,
+            source_hash,
+            shadowed_tokens,
+            surface_tokens,
+            occurred_at,
+            serde_json::json!({
+                "status": "interrupted_recovery",
+                "reason": "The process stopped before compaction completed.",
+            }),
+        );
+        insert_context_event(&transaction, &task_id, &event)?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("Unable to commit context repair: {error}"))?;
+    Ok(count)
+}
+
+pub(crate) fn repair_interrupted_agent_events(
+    connection: &mut Connection,
+) -> Result<usize, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT task_id, turn_id, step, kind
+             FROM agent_event
+             ORDER BY seq",
+        )
+        .map_err(|error| format!("Unable to inspect agent lifecycle events: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u32,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to read agent lifecycle events: {error}"))?;
+    let mut open = HashMap::<(String, String), Option<u32>>::new();
+    for row in rows {
+        let (task_id, turn_id, step, kind) =
+            row.map_err(|error| format!("Unable to decode agent lifecycle event: {error}"))?;
+        match kind.as_str() {
+            "turn_start" => {
+                open.insert((task_id, turn_id), None);
+            }
+            "turn_end" => {
+                open.retain(|(open_task, open_turn), _| {
+                    open_task != &task_id || open_turn != &turn_id
+                });
+            }
+            "step_start" => {
+                if let Some(current) = open.get_mut(&(task_id, turn_id)) {
+                    *current = Some(step);
+                }
+            }
+            "step_end" => {
+                if let Some(current) = open.get_mut(&(task_id, turn_id)) {
+                    *current = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    drop(statement);
+    if open.is_empty() {
+        return Ok(0);
+    }
+
+    let mut pending = open.into_iter().collect::<Vec<_>>();
+    pending.sort_by(|left, right| left.0.cmp(&right.0));
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("Unable to begin agent lifecycle repair: {error}"))?;
+    let interrupted_reason =
+        serde_json::to_value(crate::agent_loop::events::TurnEndReason::Interrupted)
+            .unwrap_or_else(|_| serde_json::Value::String("interrupted".to_string()));
+    for ((task_id, turn_id), open_step) in &pending {
+        if let Some(step) = open_step {
+            insert_agent_event(
+                &transaction,
+                task_id,
+                0,
+                turn_id,
+                *step,
+                "step_end",
+                super::now(),
+                &serde_json::json!({"reason":interrupted_reason.clone()}).to_string(),
+            )?;
+        }
+        insert_agent_event(
+            &transaction,
+            task_id,
+            0,
+            turn_id,
+            open_step.unwrap_or_default(),
+            "lifecycle_state",
+            super::now(),
+            &serde_json::json!({
+                "state": "idle",
+                "reason": "interrupted_recovery"
+            })
+            .to_string(),
+        )?;
+        insert_agent_event(
+            &transaction,
+            task_id,
+            0,
+            turn_id,
+            open_step.unwrap_or_default(),
+            "turn_end",
+            super::now(),
+            &serde_json::json!({"reason":interrupted_reason}).to_string(),
+        )?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("Unable to commit agent lifecycle repair: {error}"))?;
+    Ok(pending.len())
 }
 
 fn remove_legacy_task_files(path: &Path) {

@@ -88,6 +88,18 @@ pub struct AgentMemoryEntry {
     pub attachments: Vec<attachments::AttachmentRef>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct ContextState {
+    #[serde(default)]
+    pub(crate) generation: u64,
+    #[serde(default)]
+    pub(crate) active_compaction_id: Option<String>,
+    #[serde(default)]
+    pub(crate) last_compaction_id: Option<String>,
+    #[serde(default)]
+    pub(crate) surface_hash: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentPlanStep {
     pub id: String,
@@ -263,6 +275,10 @@ pub struct Task {
     pub created_at: i64,
     pub updated_at: i64,
     pub demo_mode: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<llm::ReasoningEffort>,
     #[serde(default)]
     pub archived: bool,
     #[serde(default = "default_agent_name")]
@@ -272,6 +288,8 @@ pub struct Task {
     pub messages: Vec<TaskMessage>,
     #[serde(default)]
     pub memory: Vec<AgentMemoryEntry>,
+    #[serde(default)]
+    pub(crate) context: ContextState,
     #[serde(default)]
     pub plans: Vec<AgentPlan>,
     #[serde(default)]
@@ -376,6 +394,8 @@ pub struct AgentSettings {
     pub timeout_secs: u64,
     #[serde(default)]
     pub prompt_cache: llm::PromptCacheMode,
+    #[serde(default)]
+    pub reasoning_effort: Option<llm::ReasoningEffort>,
     #[serde(default)]
     pub approval_mode: ApprovalMode,
     #[serde(default)]
